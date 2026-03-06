@@ -208,6 +208,45 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ── Volume Helper ────────────────────────────────────────────────────────────
+
+def fetch_ecs_volumes(ecs_id):
+    """Return a list of volume dicts for the given ECS. Used for image description."""
+    project_id = get_project_id()
+    try:
+        url = '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, ecs_id)
+        r = hwc_request('GET', url)
+        if r.status_code != 200:
+            return []
+        server = r.json().get('server', {})
+        attachments = server.get('os-extended-volumes:volumes_attached', [])
+        volumes = []
+        for va in attachments:
+            vol_id = va.get('id')
+            if not vol_id:
+                continue
+            vr = hwc_request('GET', '%s/v2/%s/volumes/%s' % (EVS_ENDPOINT, project_id, vol_id))
+            if vr.status_code == 200:
+                v = vr.json().get('volume', {})
+                device = ''
+                for att in v.get('attachments', []):
+                    if att.get('server_id') == ecs_id:
+                        device = att.get('device', '')
+                        break
+                volumes.append({
+                    'device': device,
+                    'name': v.get('name') or vol_id[:8],
+                    'type': v.get('volume_type', ''),
+                    'size': v.get('size'),
+                    'status': v.get('status', ''),
+                    'bootable': v.get('bootable', 'false'),
+                })
+        volumes.sort(key=lambda v: (v.get('bootable') != 'true', v.get('device', '')))
+        return volumes
+    except Exception as e:
+        log.warning('fetch_ecs_volumes error: %s', e)
+        return []
+
 # ── Backup Logic ──────────────────────────────────────────────────────────────
 
 def poll_image_active(image_id, timeout=600):
@@ -290,9 +329,24 @@ def run_backup(schedule_id):
     log.info('Starting backup: schedule=%s ecs=%s image=%s', schedule_id, sched['ecs_name'], image_name)
 
     try:
+        # Build description with volume details
+        vols = fetch_ecs_volumes(sched['ecs_id'])
+        if vols:
+            vol_lines = []
+            for v in vols:
+                rol = 'Sistema' if v.get('bootable') == 'true' else 'Datos'
+                vol_lines.append('%s | %s | %s | %s GB | %s | %s' % (
+                    v.get('device', '-'), v.get('name', '-'), v.get('type', '-'),
+                    v.get('size', '?'), v.get('status', '-'), rol))
+            vol_desc = '\nDiscos:\n' + '\n'.join(vol_lines)
+        else:
+            vol_desc = ''
+
+        description = 'Backup automatico. Programacion: %s%s' % (sched['name'], vol_desc)
+
         # Use ECS createImage action — returns 202 with Location: .../images/{image_id}
         url = '%s/v2/%s/servers/%s/action' % (ECS_ENDPOINT, project_id, sched['ecs_id'])
-        payload = {'createImage': {'name': image_name}}
+        payload = {'createImage': {'name': image_name, 'description': description}}
         r = hwc_request('POST', url, body=payload)
         if r.status_code not in (200, 202):
             raise Exception('ECS createImage HTTP %s: %s' % (r.status_code, r.text[:300]))
