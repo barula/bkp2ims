@@ -171,6 +171,12 @@ def get_db():
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = get_db()
+    # Migrate: add selected_volumes column if missing
+    try:
+        conn.execute('ALTER TABLE schedules ADD COLUMN selected_volumes TEXT DEFAULT "[]"')
+        conn.commit()
+    except Exception:
+        pass
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS schedules (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +188,8 @@ def init_db():
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             last_run TEXT,
-            next_run TEXT
+            next_run TEXT,
+            selected_volumes TEXT DEFAULT "[]"
         );
         CREATE TABLE IF NOT EXISTS job_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,6 +222,7 @@ def init_db():
             snapshot_id TEXT UNIQUE,
             snapshot_name TEXT,
             volume_id TEXT,
+            volume_role TEXT DEFAULT "data",
             size_gb INTEGER,
             created_at TEXT NOT NULL,
             deleted INTEGER DEFAULT 0
@@ -287,36 +295,58 @@ def poll_image_active(image_id, timeout=600):
             time.sleep(15)
     return False, 'Timed out waiting for image to become active'
 
-def _register_evs_snapshots(backup_row_id, schedule_id, ecs_id, image_name):
-    """Find EVS snapshots auto-created by createImage and register them in DB."""
+def _create_evs_snapshot(volume_id, name, description=''):
+    """Create an EVS snapshot and wait for it to be available. Returns snapshot dict or raises."""
+    project_id = get_project_id()
+    payload = {'snapshot': {'volume_id': volume_id, 'name': name, 'description': description, 'force': True}}
+    r = hwc_request('POST', '%s/v2/%s/snapshots' % (EVS_ENDPOINT, project_id), body=payload)
+    if r.status_code not in (200, 202):
+        raise Exception('EVS snapshot create HTTP %s: %s' % (r.status_code, r.text[:200]))
+    snap = r.json()['snapshot']
+    snap_id = snap['id']
+    # Poll until available
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        pr = hwc_request('GET', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap_id))
+        if pr.status_code == 200:
+            s = pr.json()['snapshot']
+            if s['status'] == 'available':
+                return s
+            if s['status'] == 'error':
+                raise Exception('EVS snapshot %s entered error state' % snap_id)
+        time.sleep(10)
+    raise Exception('EVS snapshot %s timed out' % snap_id)
+
+def _find_auto_snapshots(image_name):
+    """Find auto-created EVS snapshots matching 'snapshot for {image_name}'."""
     project_id = get_project_id()
     snap_name = 'snapshot for %s' % image_name
-    try:
-        # Poll up to 60s for snapshots to appear (they may take a moment)
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            r = hwc_request('GET', '%s/v2/%s/snapshots/detail' % (EVS_ENDPOINT, project_id),
-                            params={'name': snap_name})
-            if r.status_code == 200:
-                snaps = r.json().get('snapshots', [])
-                if snaps:
-                    conn = get_db()
-                    for s in snaps:
-                        conn.execute(
-                            'INSERT OR IGNORE INTO backup_snapshots (backup_image_id, schedule_id, ecs_id, snapshot_id, snapshot_name, volume_id, size_gb, created_at) VALUES (?,?,?,?,?,?,?,?)',
-                            (backup_row_id, schedule_id, ecs_id,
-                             s['id'], s['name'], s['volume_id'],
-                             s.get('size', 0),
-                             s.get('created_at', datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')))
-                        )
-                    conn.commit()
-                    conn.close()
-                    log.info('Registered %d EVS snapshots for image %s', len(snaps), image_name)
-                    return
-            time.sleep(10)
-        log.warning('Timed out waiting for EVS snapshots for %s', image_name)
-    except Exception as e:
-        log.error('_register_evs_snapshots error: %s', e)
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        r = hwc_request('GET', '%s/v2/%s/snapshots/detail' % (EVS_ENDPOINT, project_id),
+                        params={'name': snap_name})
+        if r.status_code == 200:
+            snaps = r.json().get('snapshots', [])
+            if snaps:
+                return snaps
+        time.sleep(10)
+    return []
+
+def _delete_snapshot(snap_id):
+    project_id = get_project_id()
+    r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap_id))
+    return r.status_code in (200, 202, 204)
+
+def _register_snapshot(conn, backup_row_id, schedule_id, ecs_id, snap, role):
+    conn.execute(
+        'INSERT OR IGNORE INTO backup_snapshots '
+        '(backup_image_id, schedule_id, ecs_id, snapshot_id, snapshot_name, volume_id, volume_role, size_gb, created_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?)',
+        (backup_row_id, schedule_id, ecs_id,
+         snap['id'], snap['name'], snap['volume_id'], role,
+         snap.get('size', 0),
+         snap.get('created_at', datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))[:19] + 'Z')
+    )
 
 def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
     """Delete an IMS image and all its associated EVS snapshots."""
@@ -399,59 +429,119 @@ def run_backup(schedule_id):
     log.info('Starting backup: schedule=%s ecs=%s image=%s', schedule_id, sched['ecs_name'], image_name)
 
     try:
-        # Build description with volume details
-        vols = fetch_ecs_volumes(sched['ecs_id'])
-        if vols:
-            vol_lines = []
-            for v in vols:
-                rol = 'Sistema' if v.get('bootable') == 'true' else 'Datos'
-                vol_lines.append('%s | %s | %s | %s GB | %s | %s' % (
-                    v.get('device', '-'), v.get('name', '-'), v.get('type', '-'),
-                    v.get('size', '?'), v.get('status', '-'), rol))
-            vol_desc = '\nDiscos:\n' + '\n'.join(vol_lines)
+        # Determine which volumes to back up
+        selected_vol_ids = json.loads(sched.get('selected_volumes') or '[]')
+        all_vols = fetch_ecs_volumes(sched['ecs_id'])
+        if selected_vol_ids:
+            target_vols = [v for v in all_vols if v['id'] in selected_vol_ids]
         else:
-            vol_desc = ''
+            target_vols = all_vols
 
-        description = 'Backup automatico. Programacion: %s%s' % (sched['name'], vol_desc)
+        system_vol = next((v for v in target_vols if v.get('bootable') == 'true'), None)
+        data_vols  = [v for v in target_vols if v.get('bootable') != 'true']
+        target_vol_ids = {v['id'] for v in target_vols}
 
-        # Use ECS createImage action — returns 202 with Location: .../images/{image_id}
-        url = '%s/v2/%s/servers/%s/action' % (ECS_ENDPOINT, project_id, sched['ecs_id'])
-        payload = {'createImage': {'name': image_name, 'description': description}}
-        r = hwc_request('POST', url, body=payload)
-        if r.status_code not in (200, 202):
-            raise Exception('ECS createImage HTTP %s: %s' % (r.status_code, r.text[:300]))
+        # Build description
+        vol_lines = []
+        for v in target_vols:
+            rol = 'Sistema' if v.get('bootable') == 'true' else 'Datos'
+            vol_lines.append('%s | %s | %s | %s GB | %s | %s' % (
+                v.get('device','-'), v.get('name','-'), v.get('type','-'),
+                v.get('size','?'), v.get('status','-'), rol))
+        description = 'Backup automatico. Programacion: %s\nDiscos:\n%s' % (
+            sched['name'], '\n'.join(vol_lines) if vol_lines else '-')
 
-        # Extract image_id from Location header
-        location = r.headers.get('Location', '')
-        image_id = location.rstrip('/').split('/')[-1] if location else None
-        if not image_id:
-            raise Exception('No Location header in createImage response')
+        image_id    = None
+        backup_row_id = None
 
-        log.info('Image creation started: image_id=%s', image_id)
+        # ── System disk: ECS createImage → IMS system disk image ────────────
+        if system_vol:
+            url = '%s/v2/%s/servers/%s/action' % (ECS_ENDPOINT, project_id, sched['ecs_id'])
+            r = hwc_request('POST', url, body={'createImage': {'name': image_name, 'description': description}})
+            if r.status_code not in (200, 202):
+                raise Exception('ECS createImage HTTP %s: %s' % (r.status_code, r.text[:300]))
 
-        # Poll IMS until image becomes active
-        ok, err = poll_image_active(image_id)
-        if not ok:
-            raise Exception('Image polling failed: %s' % err)
+            location = r.headers.get('Location', '')
+            image_id = location.rstrip('/').split('/')[-1] if location else None
+            if not image_id:
+                raise Exception('No Location header in createImage response')
+            log.info('System image creation started: image_id=%s', image_id)
 
+            ok, err = poll_image_active(image_id)
+            if not ok:
+                raise Exception('Image polling failed: %s' % err)
+
+            finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            conn = get_db()
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
+                (schedule_id, sched['ecs_id'], sched['ecs_name'], image_id, image_name, finished_str)
+            )
+            backup_row_id = cur.lastrowid
+            conn.commit()
+            conn.close()
+            log.info('System disk image registered: image_id=%s', image_id)
+
+            # Handle auto-created EVS snapshots from createImage
+            auto_snaps = _find_auto_snapshots(image_name)
+            conn = get_db()
+            for snap in auto_snaps:
+                vid = snap['volume_id']
+                if vid in target_vol_ids:
+                    role = 'system' if vid == system_vol['id'] else 'data'
+                    _register_snapshot(conn, backup_row_id, schedule_id, sched['ecs_id'], snap, role)
+                    log.info('Registered auto-snapshot %s role=%s size=%sGB', snap['id'][:8], role, snap.get('size'))
+                else:
+                    # Not in selection — delete
+                    conn.commit()
+                    conn.close()
+                    _delete_snapshot(snap['id'])
+                    log.info('Deleted unwanted auto-snapshot %s (vol %s not selected)', snap['id'][:8], vid[:8])
+                    conn = get_db()
+            conn.commit()
+            conn.close()
+
+        # ── Data disks WITHOUT system: explicit EVS snapshots ────────────────
+        # (If system was included, auto-snapshots already cover data disks above)
+        if not system_vol and data_vols:
+            if backup_row_id is None:
+                # No system image — create a placeholder backup_images row to anchor snapshots
+                ph_name = image_name + '-data'
+                finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                conn = get_db()
+                cur = conn.execute(
+                    'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
+                    (schedule_id, sched['ecs_id'], sched['ecs_name'], 'data-only', ph_name, finished_str)
+                )
+                backup_row_id = cur.lastrowid
+                conn.commit()
+                conn.close()
+
+            for dv in data_vols:
+                snap_name = 'bkp-data-%s-%s' % (
+                    ''.join(c if c.isalnum() or c=='-' else '-' for c in dv.get('name','vol'))[:20],
+                    datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S'))
+                log.info('Creating EVS snapshot for data disk %s (%s GB)', dv['id'][:8], dv.get('size'))
+                snap = _create_evs_snapshot(dv['id'], snap_name, description)
+                conn = get_db()
+                _register_snapshot(conn, backup_row_id, schedule_id, sched['ecs_id'], snap, 'data')
+                conn.commit()
+                conn.close()
+                log.info('Data disk snapshot created: %s', snap['id'][:8])
+
+        # ── Finalize job history ─────────────────────────────────────────────
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        msg = 'Sistema: imagen IMS' if system_vol else ''
+        if data_vols:
+            msg += ('%s | ' % (' + ' if msg else '')) + 'Datos: %d snapshot(s) EVS' % len(data_vols)
         conn = get_db()
-        cur = conn.execute(
-            'INSERT OR IGNORE INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
-            (schedule_id, sched['ecs_id'], sched['ecs_name'], image_id, image_name, finished_str)
-        )
-        backup_row_id = cur.lastrowid
         conn.execute(
             'UPDATE job_history SET status=?, image_id=?, image_name=?, finished_at=?, message=? WHERE id=?',
-            ('success', image_id, image_name, finished_str, 'Image created successfully', job_id_db)
+            ('success', image_id or 'data-only', image_name, finished_str, msg or 'Backup completado', job_id_db)
         )
         conn.commit()
         conn.close()
-        log.info('Backup success: image_id=%s', image_id)
-
-        # Register auto-created EVS snapshots (HWC creates one per disk named "snapshot for {image_name}")
-        _register_evs_snapshots(backup_row_id, schedule_id, sched['ecs_id'], image_name)
-
+        log.info('Backup success for schedule %s', schedule_id)
         apply_retention(schedule_id, sched['ecs_id'], sched['retention_count'])
 
     except Exception as e:
@@ -635,11 +725,12 @@ def api_create_schedule():
     next_run = (datetime.datetime.utcnow() +
                 datetime.timedelta(hours=int(data['frequency_hours']))).strftime('%Y-%m-%dT%H:%M:%SZ')
 
+    selected_volumes = json.dumps(data.get('selected_volumes', []))
     conn = get_db()
     cur = conn.execute(
-        'INSERT INTO schedules (name, ecs_id, ecs_name, frequency_hours, retention_count, enabled, created_at, next_run) VALUES (?,?,?,?,?,1,?,?)',
+        'INSERT INTO schedules (name, ecs_id, ecs_name, frequency_hours, retention_count, enabled, created_at, next_run, selected_volumes) VALUES (?,?,?,?,?,1,?,?,?)',
         (data['name'], data['ecs_id'], data['ecs_name'],
-         int(data['frequency_hours']), int(data['retention_count']), now_str, next_run)
+         int(data['frequency_hours']), int(data['retention_count']), now_str, next_run, selected_volumes)
     )
     sched_id = cur.lastrowid
     conn.commit()
@@ -661,12 +752,13 @@ def api_update_schedule(sched_id):
     freq = int(data.get('frequency_hours', sched['frequency_hours']))
     ret = int(data.get('retention_count', sched['retention_count']))
     enabled = int(data.get('enabled', sched['enabled']))
+    sel_vols = json.dumps(data.get('selected_volumes', json.loads(sched['selected_volumes'] or '[]')))
     next_run = (datetime.datetime.utcnow() +
                 datetime.timedelta(hours=freq)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     conn.execute(
-        'UPDATE schedules SET name=?, frequency_hours=?, retention_count=?, enabled=?, next_run=? WHERE id=?',
-        (name, freq, ret, enabled, next_run, sched_id)
+        'UPDATE schedules SET name=?, frequency_hours=?, retention_count=?, enabled=?, next_run=?, selected_volumes=? WHERE id=?',
+        (name, freq, ret, enabled, next_run, sel_vols, sched_id)
     )
     conn.commit()
     conn.close()

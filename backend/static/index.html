@@ -431,6 +431,22 @@
 
   /* ── Freq/Retention helpers ── */
   .freq-display { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+
+  /* ── Disk checkbox ── */
+  .disk-check {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+    user-select: none;
+  }
+  .disk-check:hover { border-color: var(--accent); background: var(--accent-light); }
+  .disk-check input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+  .disk-check-info { flex: 1; min-width: 0; }
+  .disk-check-name { font-size: 13px; font-weight: 500; }
+  .disk-check-meta { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 </style>
 </head>
 <body>
@@ -528,6 +544,10 @@
     </div>
     <div class="modal-body">
       <div id="modal-ecs-info" class="selected-ecs-info" style="display:none"></div>
+      <div class="form-group" id="f-vol-group">
+        <label>Discos a respaldar</label>
+        <div id="f-vol-list" style="display:flex;flex-direction:column;gap:6px;margin-top:4px"></div>
+      </div>
       <div class="form-group">
         <label>Nombre de la programacion</label>
         <input type="text" id="f-name" placeholder="ej. Backup diario produccion">
@@ -570,6 +590,7 @@
 <script>
 const API = '';
 let selectedECS = null;
+let selectedECSVolumes = [];
 let editingScheduleId = null;
 
 // ── Toast ──────────────────────────────────────────────────────────────────
@@ -684,7 +705,8 @@ async function selectECS(server) {
     ]);
     const vd = await vr.json();
     const sd = await sr.json();
-    renderVolumes(vd.volumes || []);
+    selectedECSVolumes = vd.volumes || [];
+    renderVolumes(selectedECSVolumes);
     renderECSSchedules(sd.schedules || []);
   } catch(e) {
     document.getElementById('vol-container').innerHTML = `<div class="card-body text-muted">Error: ${esc(e.message)}</div>`;
@@ -872,6 +894,36 @@ function getFreqHours() {
   return parseInt(v);
 }
 
+function renderDiskCheckboxes(vols, checkedIds) {
+  const container = document.getElementById('f-vol-list');
+  if (!vols || !vols.length) {
+    container.innerHTML = '<span class="text-muted text-sm">Sin discos disponibles</span>';
+    return;
+  }
+  container.innerHTML = vols.map(v => {
+    const isSystem = v.bootable === 'true' || v.boot_index === '0';
+    const role = isSystem ? 'Sistema' : 'Datos';
+    const roleCls = isSystem ? 'badge-info' : 'badge-stopped';
+    const checked = !checkedIds || checkedIds.length === 0 || checkedIds.includes(v.id) ? 'checked' : '';
+    return `
+      <label class="disk-check">
+        <input type="checkbox" name="vol" value="${esc(v.id)}" ${checked}>
+        <div class="disk-check-info">
+          <div class="disk-check-name">${esc(v.name || v.id.slice(0,8))}</div>
+          <div class="disk-check-meta">
+            <span class="vol-device">${esc(v.device || '-')}</span> &middot;
+            ${v.size ? v.size + ' GB' : '?'} &middot;
+            <span class="badge ${roleCls}" style="font-size:10px;padding:1px 6px">${role}</span>
+          </div>
+        </div>
+      </label>`;
+  }).join('');
+}
+
+function getSelectedVolumeIds() {
+  return Array.from(document.querySelectorAll('#f-vol-list input[name=vol]:checked')).map(i => i.value);
+}
+
 function openNewScheduleModal() {
   editingScheduleId = null;
   document.getElementById('modal-title').textContent = 'Nueva programacion';
@@ -889,6 +941,10 @@ function openNewScheduleModal() {
   } else {
     info.style.display = 'none';
   }
+
+  renderDiskCheckboxes(selectedECSVolumes, []);
+  document.getElementById('f-vol-group').style.display = selectedECSVolumes.length ? 'block' : 'none';
+
   updateFreqSummary();
   document.getElementById('modal-backdrop').classList.add('visible');
   document.getElementById('f-name').focus();
@@ -915,6 +971,11 @@ function openEditScheduleModal(sched) {
   info.style.display = 'block';
   info.innerHTML = `<strong>${esc(sched.ecs_name)}</strong>`;
 
+  let checkedIds = [];
+  try { checkedIds = JSON.parse(sched.selected_volumes || '[]'); } catch(e) {}
+  renderDiskCheckboxes(selectedECSVolumes, checkedIds);
+  document.getElementById('f-vol-group').style.display = selectedECSVolumes.length ? 'block' : 'none';
+
   updateFreqSummary();
   document.getElementById('modal-backdrop').classList.add('visible');
 }
@@ -938,11 +999,13 @@ async function saveSchedule() {
   btn.textContent = 'Guardando...';
 
   try {
+    const selected_volumes = getSelectedVolumeIds();
+
     if (editingScheduleId) {
       await fetch(`${API}/api/schedules/${editingScheduleId}`, {
         method: 'PUT',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({name, frequency_hours: freq, retention_count: retention})
+        body: JSON.stringify({name, frequency_hours: freq, retention_count: retention, selected_volumes})
       });
       toast('Programacion actualizada', 'success');
     } else {
@@ -951,7 +1014,7 @@ async function saveSchedule() {
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
           name, ecs_id: selectedECS.id, ecs_name: selectedECS.name,
-          frequency_hours: freq, retention_count: retention,
+          frequency_hours: freq, retention_count: retention, selected_volumes,
         })
       });
       toast('Programacion creada', 'success');
@@ -1006,8 +1069,11 @@ async function loadHistory() {
     c.innerHTML = items.map(h => {
       const relSnaps = h.image_name ? (snapsByImageName[h.image_name] || []) : [];
       const snapInfo = relSnaps.length
-        ? `&middot; <span class="badge badge-info">${relSnaps.length} disco${relSnaps.length > 1 ? 's' : ''}</span> `
-          + relSnaps.map(s => `<span class="text-mono" title="${esc(s.snapshot_id)}">${s.size_gb}GB</span>`).join(' ')
+        ? `&middot; ` + relSnaps.map(s => {
+            const role = s.volume_role === 'system' ? 'Sistema' : 'Datos';
+            const cls  = s.volume_role === 'system' ? 'badge-info' : 'badge-warning';
+            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB EVS</span>`;
+          }).join(' ')
         : '';
       return `
       <div class="history-item">
