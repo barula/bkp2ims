@@ -1,0 +1,42 @@
+services:
+  app:
+    build: ./backend
+    restart: unless-stopped
+    volumes:
+      - app-data:/data
+    environment:
+      - HWC_REGION=sa-argentina-1
+      - HWC_PROJECT_ID=06f1dd56ce000ff32f48c00a69f36c39
+      - DB_PATH=/data/backup.db
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - internal
+    depends_on:
+      - app
+
+volumes:
+  app-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  internal:
+    driver: bridge

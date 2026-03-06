@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ECS Backup Scheduler</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #f4f5f7;
+    --surface: #ffffff;
+    --border: #e2e4e9;
+    --border-light: #f0f1f4;
+    --text: #1a1d23;
+    --text-muted: #6b7280;
+    --text-light: #9ca3af;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --accent-light: #eff6ff;
+    --success: #059669;
+    --success-bg: #ecfdf5;
+    --warning: #d97706;
+    --warning-bg: #fffbeb;
+    --error: #dc2626;
+    --error-bg: #fef2f2;
+    --running: #7c3aed;
+    --running-bg: #f5f3ff;
+    --radius: 8px;
+    --radius-sm: 4px;
+    --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+    --shadow-md: 0 4px 6px -1px rgba(0,0,0,.08), 0 2px 4px -2px rgba(0,0,0,.04);
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 56px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .logo {
+    width: 28px; height: 28px;
+    background: var(--accent);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .logo svg { width: 16px; height: 16px; fill: none; stroke: #fff; stroke-width: 2; stroke-linecap: round; }
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; }
+  .header-meta {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 16px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .cred-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+    display: inline-block;
+    margin-right: 4px;
+  }
+  .cred-dot.stale { background: var(--error); }
+
+  /* ── Tabs ── */
+  nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    display: flex;
+    gap: 0;
+  }
+  .tab {
+    padding: 12px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color .15s, border-color .15s;
+    user-select: none;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* ── Layout ── */
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  .section { display: none; }
+  .section.active { display: block; }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .card-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-light);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .card-header h2 { font-size: 14px; font-weight: 600; }
+  .card-body { padding: 20px; }
+
+  /* ── Grid ── */
+  .ecs-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+  }
+
+  .ecs-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    cursor: pointer;
+    transition: border-color .15s, box-shadow .15s;
+    position: relative;
+  }
+  .ecs-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
+  .ecs-card.selected {
+    border-color: var(--accent);
+    background: var(--accent-light);
+  }
+  .ecs-card-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
+  .ecs-icon {
+    width: 32px; height: 32px;
+    border-radius: 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .ecs-icon svg { width: 16px; height: 16px; }
+  .ecs-name { font-weight: 600; font-size: 13px; word-break: break-all; }
+  .ecs-flavor { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+  .ecs-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .ecs-ip { font-size: 11px; color: var(--text-muted); font-family: monospace; }
+
+  /* ── Status badge ── */
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 11px; font-weight: 500;
+    padding: 2px 7px;
+    border-radius: 999px;
+  }
+  .badge-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .badge-active { background: var(--success-bg); color: var(--success); }
+  .badge-active .badge-dot { background: var(--success); }
+  .badge-stopped { background: var(--bg); color: var(--text-muted); }
+  .badge-stopped .badge-dot { background: var(--text-light); }
+  .badge-error { background: var(--error-bg); color: var(--error); }
+  .badge-error .badge-dot { background: var(--error); }
+  .badge-info { background: var(--accent-light); color: var(--accent); }
+  .badge-warning { background: var(--warning-bg); color: var(--warning); }
+  .badge-running { background: var(--running-bg); color: var(--running); }
+  .badge-running .badge-dot { background: var(--running); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+  /* ── Detail panel ── */
+  .detail-panel {
+    display: none;
+    margin-top: 20px;
+  }
+  .detail-panel.visible { display: block; }
+
+  /* ── Volume list ── */
+  .vol-table { width: 100%; border-collapse: collapse; }
+  .vol-table th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .vol-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-light);
+    font-size: 13px;
+  }
+  .vol-table tr:last-child td { border-bottom: none; }
+  .vol-device { font-family: monospace; font-size: 12px; color: var(--text-muted); }
+  .vol-type { font-size: 11px; color: var(--text-muted); }
+
+  /* ── Schedules ── */
+  .sched-table { width: 100%; border-collapse: collapse; }
+  .sched-table th {
+    text-align: left;
+    padding: 8px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    white-space: nowrap;
+  }
+  .sched-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-light);
+    vertical-align: middle;
+  }
+  .sched-table tr:last-child td { border-bottom: none; }
+  .sched-table tr:hover td { background: var(--bg); }
+
+  /* ── History ── */
+  .history-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border-light);
+  }
+  .history-item:last-child { border-bottom: none; }
+  .history-icon {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .history-icon svg { width: 13px; height: 13px; }
+  .hi-success { background: var(--success-bg); color: var(--success); }
+  .hi-failed { background: var(--error-bg); color: var(--error); }
+  .hi-running { background: var(--running-bg); color: var(--running); }
+  .history-body { flex: 1; min-width: 0; }
+  .history-title { font-weight: 500; font-size: 13px; margin-bottom: 2px; }
+  .history-sub { font-size: 12px; color: var(--text-muted); }
+  .history-time { font-size: 11px; color: var(--text-light); white-space: nowrap; }
+
+  /* ── Buttons ── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all .15s;
+    white-space: nowrap;
+  }
+  .btn svg { width: 14px; height: 14px; }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn-ghost { background: transparent; color: var(--text-muted); border-color: var(--border); }
+  .btn-ghost:hover { background: var(--bg); color: var(--text); }
+  .btn-danger { background: transparent; color: var(--error); border-color: var(--border); }
+  .btn-danger:hover { background: var(--error-bg); border-color: var(--error); }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+  .btn-icon { padding: 6px; border-radius: var(--radius-sm); }
+  .toggle-btn {
+    position: relative;
+    width: 36px; height: 20px;
+    background: var(--border);
+    border-radius: 999px;
+    border: none;
+    cursor: pointer;
+    transition: background .2s;
+    flex-shrink: 0;
+  }
+  .toggle-btn::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 16px; height: 16px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform .2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,.2);
+  }
+  .toggle-btn.on { background: var(--accent); }
+  .toggle-btn.on::after { transform: translateX(16px); }
+
+  /* ── Modal ── */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.4);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+    padding: 16px;
+    display: none;
+  }
+  .modal-backdrop.visible { display: flex; }
+  .modal {
+    background: var(--surface);
+    border-radius: var(--radius);
+    box-shadow: 0 20px 60px rgba(0,0,0,.2);
+    width: 100%; max-width: 480px;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .modal-header {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .modal-header h3 { font-size: 15px; font-weight: 600; }
+  .modal-body { padding: 20px 24px; }
+  .modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    display: flex; justify-content: flex-end; gap: 8px;
+  }
+  .close-btn {
+    background: none; border: none;
+    color: var(--text-muted); cursor: pointer;
+    padding: 4px; border-radius: 4px;
+    display: flex; align-items: center;
+  }
+  .close-btn:hover { color: var(--text); background: var(--bg); }
+  .close-btn svg { width: 18px; height: 18px; }
+
+  /* ── Forms ── */
+  .form-group { margin-bottom: 16px; }
+  .form-group:last-child { margin-bottom: 0; }
+  label { display: block; font-size: 12px; font-weight: 500; color: var(--text-muted); margin-bottom: 6px; }
+  input, select, textarea {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface);
+    transition: border-color .15s;
+    outline: none;
+    font-family: inherit;
+  }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .input-hint { font-size: 11px; color: var(--text-light); margin-top: 4px; }
+  .selected-ecs-info {
+    background: var(--accent-light);
+    border: 1px solid #bfdbfe;
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    font-size: 12px;
+  }
+  .selected-ecs-info strong { font-size: 13px; display: block; margin-bottom: 2px; }
+
+  /* ── Empty states ── */
+  .empty {
+    text-align: center;
+    padding: 48px 24px;
+    color: var(--text-muted);
+  }
+  .empty-icon { font-size: 32px; margin-bottom: 12px; opacity: .5; }
+  .empty p { font-size: 13px; }
+
+  /* ── Loading ── */
+  .spinner {
+    width: 20px; height: 20px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-row { display: flex; justify-content: center; padding: 32px; }
+
+  /* ── Utils ── */
+  .flex { display: flex; }
+  .items-center { align-items: center; }
+  .justify-between { justify-content: space-between; }
+  .gap-2 { gap: 8px; }
+  .gap-3 { gap: 12px; }
+  .mt-1 { margin-top: 4px; }
+  .mt-3 { margin-top: 12px; }
+  .mt-4 { margin-top: 16px; }
+  .text-sm { font-size: 12px; }
+  .text-muted { color: var(--text-muted); }
+  .text-mono { font-family: monospace; font-size: 12px; }
+  .fw-500 { font-weight: 500; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .section-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .section-title { font-size: 15px; font-weight: 600; }
+
+  /* ── Toast ── */
+  #toast-container {
+    position: fixed; bottom: 24px; right: 24px;
+    z-index: 2000;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .toast {
+    background: var(--text);
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    box-shadow: var(--shadow-md);
+    animation: slide-in .2s ease;
+    max-width: 320px;
+  }
+  .toast.success { background: var(--success); }
+  .toast.error { background: var(--error); }
+  @keyframes slide-in { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+  /* ── Freq/Retention helpers ── */
+  .freq-display { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+  </div>
+  <h1>ECS Backup Scheduler</h1>
+  <div class="header-meta">
+    <span id="region-badge" class="badge badge-info" style="font-size:11px"></span>
+    <span id="cred-status"><span class="cred-dot" id="cred-dot"></span><span id="cred-text">...</span></span>
+  </div>
+</header>
+
+<nav>
+  <div class="tab active" onclick="switchTab('ecs')">Instancias ECS</div>
+  <div class="tab" onclick="switchTab('schedules')">Programaciones</div>
+  <div class="tab" onclick="switchTab('history')">Historial</div>
+</nav>
+
+<main>
+  <!-- ── TAB: ECS ── -->
+  <div id="tab-ecs" class="section active">
+    <div class="section-toolbar">
+      <span class="section-title">Instancias ECS</span>
+      <button class="btn btn-ghost btn-sm" onclick="loadECS()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Actualizar
+      </button>
+    </div>
+    <div id="ecs-grid" class="ecs-grid">
+      <div class="loading-row" style="grid-column: 1/-1"><div class="spinner"></div></div>
+    </div>
+
+    <!-- Detail panel -->
+    <div id="detail-panel" class="detail-panel">
+      <div class="card mt-4">
+        <div class="card-header">
+          <h2 id="detail-title">Discos</h2>
+          <button class="btn btn-primary btn-sm" onclick="openNewScheduleModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Nueva programacion
+          </button>
+        </div>
+        <div id="vol-container"></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="card-header">
+          <h2>Programaciones activas</h2>
+        </div>
+        <div id="ecs-sched-container"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TAB: Schedules ── -->
+  <div id="tab-schedules" class="section">
+    <div class="section-toolbar">
+      <span class="section-title">Todas las programaciones</span>
+      <button class="btn btn-ghost btn-sm" onclick="loadSchedules()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Actualizar
+      </button>
+    </div>
+    <div class="card">
+      <div id="schedules-container"></div>
+    </div>
+  </div>
+
+  <!-- ── TAB: History ── -->
+  <div id="tab-history" class="section">
+    <div class="section-toolbar">
+      <span class="section-title">Historial de backups</span>
+      <button class="btn btn-ghost btn-sm" onclick="loadHistory()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Actualizar
+      </button>
+    </div>
+    <div class="card">
+      <div id="history-container" style="padding: 20px;"></div>
+    </div>
+  </div>
+</main>
+
+<!-- ── Modal: New/Edit Schedule ── -->
+<div id="modal-backdrop" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">Nueva programacion</h3>
+      <button class="close-btn" onclick="closeModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div id="modal-ecs-info" class="selected-ecs-info" style="display:none"></div>
+      <div class="form-group">
+        <label>Nombre de la programacion</label>
+        <input type="text" id="f-name" placeholder="ej. Backup diario produccion">
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Frecuencia</label>
+          <select id="f-freq-preset" onchange="onFreqPreset()">
+            <option value="1">Cada hora</option>
+            <option value="6">Cada 6 horas</option>
+            <option value="12">Cada 12 horas</option>
+            <option value="24" selected>Diario</option>
+            <option value="48">Cada 2 dias</option>
+            <option value="72">Cada 3 dias</option>
+            <option value="168">Semanal</option>
+            <option value="custom">Personalizado...</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Retener (imagenes)</label>
+          <input type="number" id="f-retention" value="7" min="1" max="365" placeholder="7">
+          <div class="input-hint">Ultimas N imagenes por ECS</div>
+        </div>
+      </div>
+      <div class="form-group" id="f-custom-hours-group" style="display:none">
+        <label>Intervalo en horas</label>
+        <input type="number" id="f-custom-hours" min="1" max="8760" placeholder="24">
+      </div>
+      <div id="f-freq-summary" class="freq-display"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveSchedule()" id="btn-save-sched">Crear programacion</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+const API = '';
+let selectedECS = null;
+let editingScheduleId = null;
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function toast(msg, type = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ── Status Bar ─────────────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const r = await fetch(`${API}/api/status`);
+    const d = await r.json();
+    document.getElementById('region-badge').textContent = d.region || 'unknown';
+    if (d.ok) {
+      const exp = new Date(d.expires_at);
+      const mins = Math.round((exp - Date.now()) / 60000);
+      document.getElementById('cred-text').textContent = `Credenciales validas (${mins}m)`;
+      document.getElementById('cred-dot').className = 'cred-dot';
+    } else {
+      document.getElementById('cred-text').textContent = 'Error credenciales';
+      document.getElementById('cred-dot').className = 'cred-dot stale';
+    }
+  } catch(e) {
+    document.getElementById('cred-text').textContent = 'Sin conexion';
+    document.getElementById('cred-dot').className = 'cred-dot stale';
+  }
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const names = ['ecs','schedules','history'];
+    t.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById(`tab-${name}`).classList.add('active');
+  if (name === 'schedules') loadSchedules();
+  if (name === 'history') loadHistory();
+}
+
+// ── ECS ────────────────────────────────────────────────────────────────────
+function statusBadge(s) {
+  const map = {
+    'ACTIVE': ['badge-active', 'ACTIVA'],
+    'SHUTOFF': ['badge-stopped', 'DETENIDA'],
+    'ERROR': ['badge-error', 'ERROR'],
+    'BUILD': ['badge-warning', 'CREANDO'],
+    'REBOOT': ['badge-warning', 'REINICIANDO'],
+  };
+  const [cls, label] = map[s] || ['badge-stopped', s || 'DESCONOCIDO'];
+  return `<span class="badge ${cls}"><span class="badge-dot"></span>${label}</span>`;
+}
+
+async function loadECS() {
+  const grid = document.getElementById('ecs-grid');
+  grid.innerHTML = '<div class="loading-row" style="grid-column:1/-1"><div class="spinner"></div></div>';
+  try {
+    const r = await fetch(`${API}/api/ecs`);
+    const d = await r.json();
+    if (!d.servers || d.servers.length === 0) {
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1"><div class="empty-icon">&#9729;</div><p>No se encontraron instancias ECS</p></div>';
+      return;
+    }
+    grid.innerHTML = d.servers.map(s => `
+      <div class="ecs-card" id="ecs-${s.id}" onclick="selectECS(${JSON.stringify(s).replace(/"/g,'&quot;')})">
+        <div class="ecs-card-header">
+          <div class="ecs-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/>
+            </svg>
+          </div>
+          <div style="flex:1;min-width:0">
+            <div class="ecs-name truncate">${esc(s.name)}</div>
+            <div class="ecs-flavor">${esc(s.flavor || '')} &middot; ${s.volume_ids ? s.volume_ids.length : 0} disco(s)</div>
+          </div>
+          ${statusBadge(s.status)}
+        </div>
+        <div class="ecs-meta">
+          ${s.ips.map(ip => `<span class="ecs-ip">${esc(ip.ip)}</span>`).join('')}
+          ${s.az ? `<span class="text-sm text-muted">${esc(s.az)}</span>` : ''}
+        </div>
+        ${s.image_name ? `<div class="text-sm text-muted mt-1 truncate">${esc(s.image_name)}</div>` : ''}
+      </div>
+    `).join('');
+  } catch(e) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><p>Error cargando ECS: ${esc(e.message)}</p></div>`;
+  }
+}
+
+async function selectECS(server) {
+  selectedECS = server;
+  document.querySelectorAll('.ecs-card').forEach(c => c.classList.remove('selected'));
+  const card = document.getElementById(`ecs-${server.id}`);
+  if (card) { card.classList.add('selected'); card.scrollIntoView({behavior:'smooth', block:'nearest'}); }
+
+  const panel = document.getElementById('detail-panel');
+  panel.classList.add('visible');
+  document.getElementById('detail-title').textContent = `Discos — ${server.name}`;
+
+  // Load volumes
+  document.getElementById('vol-container').innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  document.getElementById('ecs-sched-container').innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+
+  try {
+    const [vr, sr] = await Promise.all([
+      fetch(`${API}/api/ecs/${server.id}/volumes`),
+      fetch(`${API}/api/schedules?ecs_id=${server.id}`),
+    ]);
+    const vd = await vr.json();
+    const sd = await sr.json();
+    renderVolumes(vd.volumes || []);
+    renderECSSchedules(sd.schedules || []);
+  } catch(e) {
+    document.getElementById('vol-container').innerHTML = `<div class="card-body text-muted">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderVolumes(vols) {
+  if (!vols.length) {
+    document.getElementById('vol-container').innerHTML = '<div class="empty"><p>Sin discos</p></div>';
+    return;
+  }
+  document.getElementById('vol-container').innerHTML = `
+    <table class="vol-table">
+      <thead><tr>
+        <th>Dispositivo</th>
+        <th>Nombre</th>
+        <th>Tipo</th>
+        <th>Tamano</th>
+        <th>Estado</th>
+        <th>Rol</th>
+      </tr></thead>
+      <tbody>
+        ${vols.map(v => `
+          <tr>
+            <td><span class="vol-device">${esc(v.device || '-')}</span></td>
+            <td class="fw-500">${esc(v.name || v.id?.slice(0,8) || '-')}</td>
+            <td><span class="vol-type">${esc(v.type || '-')}</span></td>
+            <td>${v.size ? v.size + ' GB' : '-'}</td>
+            <td>${v.status ? `<span class="badge ${v.status==='in-use'?'badge-active':'badge-stopped'}">${esc(v.status)}</span>` : '-'}</td>
+            <td>${v.bootable === 'true' || v.boot_index === '0' ?
+              '<span class="badge badge-info">Sistema</span>' :
+              '<span class="badge badge-stopped">Datos</span>'}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderECSSchedules(scheds) {
+  if (!scheds.length) {
+    document.getElementById('ecs-sched-container').innerHTML =
+      '<div class="empty"><p>Sin programaciones. Crea una con el boton "Nueva programacion".</p></div>';
+    return;
+  }
+  document.getElementById('ecs-sched-container').innerHTML = renderScheduleTable(scheds);
+}
+
+// ── Schedules ──────────────────────────────────────────────────────────────
+function freqLabel(h) {
+  if (h === 1) return 'Cada hora';
+  if (h < 24) return `Cada ${h}h`;
+  if (h === 24) return 'Diario';
+  if (h === 48) return 'Cada 2 dias';
+  if (h === 72) return 'Cada 3 dias';
+  if (h === 168) return 'Semanal';
+  if (h % 24 === 0) return `Cada ${h/24} dias`;
+  return `Cada ${h}h`;
+}
+
+function fmtDate(s) {
+  if (!s) return '—';
+  try {
+    const d = new Date(s);
+    return d.toLocaleString('es-AR', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+  } catch { return s; }
+}
+
+function renderScheduleTable(scheds) {
+  if (!scheds.length) return '<div class="empty"><p>Sin programaciones</p></div>';
+  return `
+    <table class="sched-table">
+      <thead><tr>
+        <th>Nombre</th>
+        <th>ECS</th>
+        <th>Frecuencia</th>
+        <th>Retener</th>
+        <th>Ultimo backup</th>
+        <th>Proximo</th>
+        <th>Estado</th>
+        <th></th>
+      </tr></thead>
+      <tbody>
+        ${scheds.map(s => `
+          <tr>
+            <td class="fw-500">${esc(s.name)}</td>
+            <td class="truncate text-muted" style="max-width:140px">${esc(s.ecs_name)}</td>
+            <td>${freqLabel(s.frequency_hours)}</td>
+            <td>${s.retention_count} img</td>
+            <td class="text-sm text-muted">${fmtDate(s.last_run)}</td>
+            <td class="text-sm text-muted">${fmtDate(s.next_run)}</td>
+            <td>
+              <button class="toggle-btn ${s.enabled?'on':''}" title="${s.enabled?'Activa':'Inactiva'}"
+                onclick="toggleSchedule(${s.id}, ${s.enabled}, this)"></button>
+            </td>
+            <td>
+              <div class="flex gap-2">
+                <button class="btn btn-ghost btn-sm" title="Ejecutar ahora" onclick="runNow(${s.id}, '${esc(s.name)}')">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                </button>
+                <button class="btn btn-ghost btn-sm" title="Editar" onclick="openEditScheduleModal(${JSON.stringify(s).replace(/"/g,'&quot;')})">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                </button>
+                <button class="btn btn-danger btn-sm" title="Eliminar" onclick="deleteSchedule(${s.id}, '${esc(s.name)}')">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6m4-6v6"/><path d="M9 6V4h6v2"/></svg>
+                </button>
+              </div>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+async function loadSchedules() {
+  const c = document.getElementById('schedules-container');
+  c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  try {
+    const r = await fetch(`${API}/api/schedules`);
+    const d = await r.json();
+    c.innerHTML = renderScheduleTable(d.schedules || []);
+  } catch(e) {
+    c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
+  }
+}
+
+async function toggleSchedule(id, currentEnabled, btn) {
+  const newEnabled = currentEnabled ? 0 : 1;
+  try {
+    await fetch(`${API}/api/schedules/${id}`, {
+      method: 'PUT',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: newEnabled})
+    });
+    btn.classList.toggle('on', !!newEnabled);
+    btn.title = newEnabled ? 'Activa' : 'Inactiva';
+    toast(newEnabled ? 'Programacion activada' : 'Programacion pausada');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function runNow(id, name) {
+  try {
+    await fetch(`${API}/api/schedules/${id}/run`, {method:'POST'});
+    toast(`Backup iniciado: ${name}`, 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function deleteSchedule(id, name) {
+  if (!confirm(`Eliminar la programacion "${name}"?\nLas imagenes creadas no se eliminaran.`)) return;
+  try {
+    await fetch(`${API}/api/schedules/${id}`, {method:'DELETE'});
+    toast('Programacion eliminada');
+    loadSchedules();
+    if (selectedECS) {
+      const sr = await fetch(`${API}/api/schedules?ecs_id=${selectedECS.id}`);
+      const sd = await sr.json();
+      renderECSSchedules(sd.schedules || []);
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── Modal ──────────────────────────────────────────────────────────────────
+function onFreqPreset() {
+  const v = document.getElementById('f-freq-preset').value;
+  const cg = document.getElementById('f-custom-hours-group');
+  cg.style.display = v === 'custom' ? 'block' : 'none';
+  updateFreqSummary();
+}
+
+function updateFreqSummary() {
+  const v = document.getElementById('f-freq-preset').value;
+  const h = v === 'custom' ? parseInt(document.getElementById('f-custom-hours').value) || 0 : parseInt(v);
+  const ret = parseInt(document.getElementById('f-retention').value) || 7;
+  const s = document.getElementById('f-freq-summary');
+  if (h > 0) {
+    const days = (h * ret / 24).toFixed(1);
+    s.textContent = `Se tomara un backup ${freqLabel(h).toLowerCase()} y se conservaran las ultimas ${ret} imagenes (~${days} dias de cobertura).`;
+  } else s.textContent = '';
+}
+
+function getFreqHours() {
+  const v = document.getElementById('f-freq-preset').value;
+  if (v === 'custom') return parseInt(document.getElementById('f-custom-hours').value) || 24;
+  return parseInt(v);
+}
+
+function openNewScheduleModal() {
+  editingScheduleId = null;
+  document.getElementById('modal-title').textContent = 'Nueva programacion';
+  document.getElementById('btn-save-sched').textContent = 'Crear programacion';
+  document.getElementById('f-name').value = selectedECS ? `Backup ${selectedECS.name}` : '';
+  document.getElementById('f-freq-preset').value = '24';
+  document.getElementById('f-retention').value = '7';
+  document.getElementById('f-custom-hours').value = '';
+  document.getElementById('f-custom-hours-group').style.display = 'none';
+
+  const info = document.getElementById('modal-ecs-info');
+  if (selectedECS) {
+    info.style.display = 'block';
+    info.innerHTML = `<strong>${esc(selectedECS.name)}</strong>${selectedECS.ips.join(', ')} &middot; ${selectedECS.flavor}`;
+  } else {
+    info.style.display = 'none';
+  }
+  updateFreqSummary();
+  document.getElementById('modal-backdrop').classList.add('visible');
+  document.getElementById('f-name').focus();
+}
+
+function openEditScheduleModal(sched) {
+  editingScheduleId = sched.id;
+  document.getElementById('modal-title').textContent = 'Editar programacion';
+  document.getElementById('btn-save-sched').textContent = 'Guardar cambios';
+  document.getElementById('f-name').value = sched.name;
+  document.getElementById('f-retention').value = sched.retention_count;
+
+  const presets = [1, 6, 12, 24, 48, 72, 168];
+  if (presets.includes(sched.frequency_hours)) {
+    document.getElementById('f-freq-preset').value = sched.frequency_hours;
+    document.getElementById('f-custom-hours-group').style.display = 'none';
+  } else {
+    document.getElementById('f-freq-preset').value = 'custom';
+    document.getElementById('f-custom-hours').value = sched.frequency_hours;
+    document.getElementById('f-custom-hours-group').style.display = 'block';
+  }
+
+  const info = document.getElementById('modal-ecs-info');
+  info.style.display = 'block';
+  info.innerHTML = `<strong>${esc(sched.ecs_name)}</strong>`;
+
+  updateFreqSummary();
+  document.getElementById('modal-backdrop').classList.add('visible');
+}
+
+function closeModal() {
+  document.getElementById('modal-backdrop').classList.remove('visible');
+}
+
+async function saveSchedule() {
+  const name = document.getElementById('f-name').value.trim();
+  const freq = getFreqHours();
+  const retention = parseInt(document.getElementById('f-retention').value);
+
+  if (!name) { toast('Ingresa un nombre', 'error'); return; }
+  if (!freq || freq < 1) { toast('Frecuencia invalida', 'error'); return; }
+  if (!retention || retention < 1) { toast('Retencion invalida', 'error'); return; }
+  if (!editingScheduleId && !selectedECS) { toast('Selecciona una ECS primero', 'error'); return; }
+
+  const btn = document.getElementById('btn-save-sched');
+  btn.disabled = true;
+  btn.textContent = 'Guardando...';
+
+  try {
+    if (editingScheduleId) {
+      await fetch(`${API}/api/schedules/${editingScheduleId}`, {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({name, frequency_hours: freq, retention_count: retention})
+      });
+      toast('Programacion actualizada', 'success');
+    } else {
+      await fetch(`${API}/api/schedules`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          name, ecs_id: selectedECS.id, ecs_name: selectedECS.name,
+          frequency_hours: freq, retention_count: retention,
+        })
+      });
+      toast('Programacion creada', 'success');
+    }
+    closeModal();
+    loadSchedules();
+    if (selectedECS) {
+      const sr = await fetch(`${API}/api/schedules?ecs_id=${selectedECS.id}`);
+      const sd = await sr.json();
+      renderECSSchedules(sd.schedules || []);
+    }
+  } catch(e) {
+    toast('Error: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = editingScheduleId ? 'Guardar cambios' : 'Crear programacion';
+  }
+}
+
+// ── History ────────────────────────────────────────────────────────────────
+function statusIcon(status) {
+  if (status === 'success') return `<div class="history-icon hi-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg></div>`;
+  if (status === 'failed') return `<div class="history-icon hi-failed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></div>`;
+  return `<div class="history-icon hi-running"><div class="spinner" style="width:14px;height:14px;border-width:2px"></div></div>`;
+}
+
+async function loadHistory() {
+  const c = document.getElementById('history-container');
+  c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  try {
+    const r = await fetch(`${API}/api/history?limit=60`);
+    const d = await r.json();
+    const items = d.history || [];
+    if (!items.length) {
+      c.innerHTML = '<div class="empty"><p>Sin historial de backups</p></div>';
+      return;
+    }
+    c.innerHTML = items.map(h => `
+      <div class="history-item">
+        ${statusIcon(h.status)}
+        <div class="history-body">
+          <div class="history-title">${esc(h.ecs_name || '—')} &mdash; <span class="text-muted">${esc(h.schedule_name || '—')}</span></div>
+          <div class="history-sub">
+            ${h.image_name ? `<span class="text-mono">${esc(h.image_name)}</span> &middot; ` : ''}
+            <span class="badge ${h.status==='success'?'badge-active':h.status==='failed'?'badge-error':'badge-running'}">${h.status}</span>
+            ${h.message && h.status !== 'success' ? `&middot; ${esc(h.message.slice(0,120))}` : ''}
+          </div>
+        </div>
+        <div class="history-time">${fmtDate(h.started_at)}</div>
+      </div>
+    `).join('');
+  } catch(e) {
+    c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
+  }
+}
+
+// ── Utils ──────────────────────────────────────────────────────────────────
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Close modal on backdrop click
+document.getElementById('modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+// Keyboard shortcut
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+// ── Init ───────────────────────────────────────────────────────────────────
+loadStatus();
+loadECS();
+setInterval(loadStatus, 60000);
+document.getElementById('f-retention').addEventListener('input', updateFreqSummary);
+document.getElementById('f-custom-hours').addEventListener('input', updateFreqSummary);
+</script>
+</body>
+</html>
