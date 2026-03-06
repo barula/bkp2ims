@@ -982,14 +982,34 @@ async function loadHistory() {
   const c = document.getElementById('history-container');
   c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
   try {
-    const r = await fetch(`${API}/api/history?limit=60`);
-    const d = await r.json();
-    const items = d.history || [];
+    const [hr, sr] = await Promise.all([
+      fetch(`${API}/api/history?limit=60`),
+      fetch(`${API}/api/snapshots`),
+    ]);
+    const items = (await hr.json()).history || [];
+    const snaps = (await sr.json()).snapshots || [];
+
+    // Group snapshots by backup_image_id (mapped via image_id in job_history)
+    // We'll group by image_name since that's the common key
+    const snapsByImageName = {};
+    snaps.forEach(s => {
+      // snapshot_name = "snapshot for {image_name}"
+      const imgName = s.snapshot_name.replace(/^snapshot for /, '');
+      if (!snapsByImageName[imgName]) snapsByImageName[imgName] = [];
+      snapsByImageName[imgName].push(s);
+    });
+
     if (!items.length) {
       c.innerHTML = '<div class="empty"><p>Sin historial de backups</p></div>';
       return;
     }
-    c.innerHTML = items.map(h => `
+    c.innerHTML = items.map(h => {
+      const relSnaps = h.image_name ? (snapsByImageName[h.image_name] || []) : [];
+      const snapInfo = relSnaps.length
+        ? `&middot; <span class="badge badge-info">${relSnaps.length} disco${relSnaps.length > 1 ? 's' : ''}</span> `
+          + relSnaps.map(s => `<span class="text-mono" title="${esc(s.snapshot_id)}">${s.size_gb}GB</span>`).join(' ')
+        : '';
+      return `
       <div class="history-item">
         ${statusIcon(h.status)}
         <div class="history-body">
@@ -997,12 +1017,13 @@ async function loadHistory() {
           <div class="history-sub">
             ${h.image_name ? `<span class="text-mono">${esc(h.image_name)}</span> &middot; ` : ''}
             <span class="badge ${h.status==='success'?'badge-active':h.status==='failed'?'badge-error':'badge-running'}">${h.status}</span>
+            ${snapInfo}
             ${h.message && h.status !== 'success' ? `&middot; ${esc(h.message.slice(0,120))}` : ''}
           </div>
         </div>
         <div class="history-time">${fmtDate(h.started_at)}</div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
   } catch(e) {
     c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
   }

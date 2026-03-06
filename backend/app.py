@@ -81,9 +81,12 @@ def hwc_request(method, url, body=None, params=None):
     ak, sk, token = cred['ak'], cred['sk'], cred['token']
 
     if params:
-        qs = urlencode(sorted(params.items()))
+        # Use quote() not urlencode() — urlencode encodes spaces as '+' but
+        # canonical query string requires '%20', causing signature mismatch
+        qs_parts = ['%s=%s' % (quote(str(k), safe=''), quote(str(v), safe=''))
+                    for k, v in sorted(params.items())]
         sep = '&' if '?' in url else '?'
-        url = url + sep + qs
+        url = url + sep + '&'.join(qs_parts)
 
     parsed = urlparse(url)
     host = parsed.netloc
@@ -204,6 +207,18 @@ def init_db():
             created_at TEXT NOT NULL,
             deleted INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS backup_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            backup_image_id INTEGER,
+            schedule_id INTEGER,
+            ecs_id TEXT,
+            snapshot_id TEXT UNIQUE,
+            snapshot_name TEXT,
+            volume_id TEXT,
+            size_gb INTEGER,
+            created_at TEXT NOT NULL,
+            deleted INTEGER DEFAULT 0
+        );
     ''')
     conn.commit()
     conn.close()
@@ -272,11 +287,80 @@ def poll_image_active(image_id, timeout=600):
             time.sleep(15)
     return False, 'Timed out waiting for image to become active'
 
+def _register_evs_snapshots(backup_row_id, schedule_id, ecs_id, image_name):
+    """Find EVS snapshots auto-created by createImage and register them in DB."""
+    project_id = get_project_id()
+    snap_name = 'snapshot for %s' % image_name
+    try:
+        # Poll up to 60s for snapshots to appear (they may take a moment)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            r = hwc_request('GET', '%s/v2/%s/snapshots/detail' % (EVS_ENDPOINT, project_id),
+                            params={'name': snap_name})
+            if r.status_code == 200:
+                snaps = r.json().get('snapshots', [])
+                if snaps:
+                    conn = get_db()
+                    for s in snaps:
+                        conn.execute(
+                            'INSERT OR IGNORE INTO backup_snapshots (backup_image_id, schedule_id, ecs_id, snapshot_id, snapshot_name, volume_id, size_gb, created_at) VALUES (?,?,?,?,?,?,?,?)',
+                            (backup_row_id, schedule_id, ecs_id,
+                             s['id'], s['name'], s['volume_id'],
+                             s.get('size', 0),
+                             s.get('created_at', datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')))
+                        )
+                    conn.commit()
+                    conn.close()
+                    log.info('Registered %d EVS snapshots for image %s', len(snaps), image_name)
+                    return
+            time.sleep(10)
+        log.warning('Timed out waiting for EVS snapshots for %s', image_name)
+    except Exception as e:
+        log.error('_register_evs_snapshots error: %s', e)
+
+def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
+    """Delete an IMS image and all its associated EVS snapshots."""
+    project_id = get_project_id()
+    # Delete IMS image
+    try:
+        r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, img_id))
+        if r.status_code in (200, 204):
+            log.info('Deleted IMS image %s (%s)', img_id, img_name)
+            conn = get_db()
+            conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
+            conn.commit()
+            conn.close()
+        else:
+            log.warning('Delete IMS image %s: HTTP %s %s', img_id, r.status_code, r.text[:150])
+    except Exception as e:
+        log.error('Delete IMS image %s error: %s', img_id, e)
+
+    # Delete associated EVS snapshots
+    conn = get_db()
+    snaps = conn.execute(
+        'SELECT snapshot_id, snapshot_name FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+        (backup_image_row_id,)
+    ).fetchall()
+    conn.close()
+    for snap in snaps:
+        try:
+            r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap['snapshot_id']))
+            if r.status_code in (200, 202, 204):
+                log.info('Deleted EVS snapshot %s (%s)', snap['snapshot_id'], snap['snapshot_name'])
+                conn = get_db()
+                conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (snap['snapshot_id'],))
+                conn.commit()
+                conn.close()
+            else:
+                log.warning('Delete snapshot %s: HTTP %s %s', snap['snapshot_id'], r.status_code, r.text[:150])
+        except Exception as e:
+            log.error('Delete snapshot %s error: %s', snap['snapshot_id'], e)
+
 def apply_retention(schedule_id, ecs_id, retention_count):
-    """Delete oldest backup images beyond retention_count for this schedule."""
+    """Delete oldest backup images (+ snapshots) beyond retention_count for this schedule."""
     conn = get_db()
     rows = conn.execute(
-        'SELECT image_id, image_name FROM backup_images WHERE schedule_id=? AND ecs_id=? AND deleted=0 ORDER BY created_at ASC',
+        'SELECT id, image_id, image_name FROM backup_images WHERE schedule_id=? AND ecs_id=? AND deleted=0 ORDER BY created_at ASC',
         (schedule_id, ecs_id)
     ).fetchall()
     conn.close()
@@ -284,22 +368,8 @@ def apply_retention(schedule_id, ecs_id, retention_count):
     excess = len(rows) - retention_count
     if excess <= 0:
         return
-    to_delete = rows[:excess]
-    for row in to_delete:
-        img_id = row['image_id']
-        try:
-            url = '%s/v2/images/%s' % (IMS_ENDPOINT, img_id)
-            r = hwc_request('DELETE', url)
-            if r.status_code in (200, 204):
-                log.info('Retention: deleted image %s (%s)', img_id, row['image_name'])
-                conn = get_db()
-                conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
-                conn.commit()
-                conn.close()
-            else:
-                log.warning('Retention: delete image %s returned %s: %s', img_id, r.status_code, r.text[:200])
-        except Exception as e:
-            log.error('Retention: error deleting image %s: %s', img_id, e)
+    for row in rows[:excess]:
+        delete_image_and_snapshots(row['image_id'], row['image_name'], row['id'])
 
 def run_backup(schedule_id):
     """Execute a backup for a given schedule."""
@@ -366,10 +436,11 @@ def run_backup(schedule_id):
 
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         conn = get_db()
-        conn.execute(
+        cur = conn.execute(
             'INSERT OR IGNORE INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
             (schedule_id, sched['ecs_id'], sched['ecs_name'], image_id, image_name, finished_str)
         )
+        backup_row_id = cur.lastrowid
         conn.execute(
             'UPDATE job_history SET status=?, image_id=?, image_name=?, finished_at=?, message=? WHERE id=?',
             ('success', image_id, image_name, finished_str, 'Image created successfully', job_id_db)
@@ -377,6 +448,10 @@ def run_backup(schedule_id):
         conn.commit()
         conn.close()
         log.info('Backup success: image_id=%s', image_id)
+
+        # Register auto-created EVS snapshots (HWC creates one per disk named "snapshot for {image_name}")
+        _register_evs_snapshots(backup_row_id, schedule_id, sched['ecs_id'], image_name)
+
         apply_retention(schedule_id, sched['ecs_id'], sched['retention_count'])
 
     except Exception as e:
@@ -656,18 +731,31 @@ def api_images():
 @app.route('/api/images/<image_id>', methods=['DELETE'])
 def api_delete_image(image_id):
     try:
-        url = '%s/v2/images/%s' % (IMS_ENDPOINT, image_id)
-        r = hwc_request('DELETE', url)
-        if r.status_code in (200, 204):
-            conn = get_db()
-            conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (image_id,))
-            conn.commit()
-            conn.close()
-            return jsonify({'ok': True})
-        else:
-            return jsonify({'error': 'HTTP %s: %s' % (r.status_code, r.text[:200])}), r.status_code
+        conn = get_db()
+        row = conn.execute('SELECT id, image_name FROM backup_images WHERE image_id=?', (image_id,)).fetchone()
+        conn.close()
+        row_id = row['id'] if row else 0
+        img_name = row['image_name'] if row else ''
+        delete_image_and_snapshots(image_id, img_name, row_id)
+        return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshots')
+def api_snapshots():
+    ecs_id = request.args.get('ecs_id')
+    sched_id = request.args.get('schedule_id')
+    conn = get_db()
+    q = 'SELECT * FROM backup_snapshots WHERE deleted=0'
+    params = []
+    if ecs_id:
+        q += ' AND ecs_id=?'; params.append(ecs_id)
+    if sched_id:
+        q += ' AND schedule_id=?'; params.append(sched_id)
+    q += ' ORDER BY created_at DESC'
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify({'snapshots': [dict(r) for r in rows]})
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
