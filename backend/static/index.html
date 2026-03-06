@@ -884,7 +884,7 @@ function openNewScheduleModal() {
   const info = document.getElementById('modal-ecs-info');
   if (selectedECS) {
     info.style.display = 'block';
-    info.innerHTML = `<strong>${esc(selectedECS.name)}</strong>${selectedECS.ips.join(', ')} &middot; ${selectedECS.flavor}`;
+    info.innerHTML = `<strong>${esc(selectedECS.name)}</strong>${selectedECS.ips.map(i => i.ip).join(', ')} &middot; ${selectedECS.flavor}`;
   } else {
     info.style.display = 'none';
   }
