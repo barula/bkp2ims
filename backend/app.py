@@ -257,6 +257,7 @@ def fetch_ecs_volumes(ecs_id):
                         device = att.get('device', '')
                         break
                 volumes.append({
+                    'id': vol_id,
                     'device': device,
                     'name': v.get('name') or vol_id[:8],
                     'type': v.get('volume_type', ''),
@@ -410,6 +411,7 @@ def run_backup(schedule_id):
 
     if not sched or not sched['enabled']:
         return
+    sched = dict(sched)  # sqlite3.Row → dict (needed for .get())
 
     now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     ts = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')
@@ -545,8 +547,9 @@ def run_backup(schedule_id):
         apply_retention(schedule_id, sched['ecs_id'], sched['retention_count'])
 
     except Exception as e:
+        import traceback
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        log.error('Backup failed for schedule %s: %s', schedule_id, e)
+        log.error('Backup failed for schedule %s: %s\n%s', schedule_id, e, traceback.format_exc())
         conn = get_db()
         conn.execute(
             'UPDATE job_history SET status=?, message=?, finished_at=? WHERE id=?',
