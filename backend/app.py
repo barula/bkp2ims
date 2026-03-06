@@ -171,12 +171,16 @@ def get_db():
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = get_db()
-    # Migrate: add selected_volumes column if missing
-    try:
-        conn.execute('ALTER TABLE schedules ADD COLUMN selected_volumes TEXT DEFAULT "[]"')
-        conn.commit()
-    except Exception:
-        pass
+    # Migrations: add columns if missing
+    for migration in [
+        'ALTER TABLE schedules ADD COLUMN selected_volumes TEXT DEFAULT "[]"',
+        'ALTER TABLE backup_snapshots ADD COLUMN volume_role TEXT DEFAULT "data"',
+    ]:
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except Exception:
+            pass
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS schedules (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -441,7 +445,6 @@ def run_backup(schedule_id):
 
         system_vol = next((v for v in target_vols if v.get('bootable') == 'true'), None)
         data_vols  = [v for v in target_vols if v.get('bootable') != 'true']
-        target_vol_ids = {v['id'] for v in target_vols}
 
         # Build description
         vol_lines = []
@@ -484,28 +487,12 @@ def run_backup(schedule_id):
             conn.close()
             log.info('System disk image registered: image_id=%s', image_id)
 
-            # Handle auto-created EVS snapshots from createImage
-            auto_snaps = _find_auto_snapshots(image_name)
-            conn = get_db()
-            for snap in auto_snaps:
-                vid = snap['volume_id']
-                if vid in target_vol_ids:
-                    role = 'system' if vid == system_vol['id'] else 'data'
-                    _register_snapshot(conn, backup_row_id, schedule_id, sched['ecs_id'], snap, role)
-                    log.info('Registered auto-snapshot %s role=%s size=%sGB', snap['id'][:8], role, snap.get('size'))
-                else:
-                    # Not in selection — delete
-                    conn.commit()
-                    conn.close()
-                    _delete_snapshot(snap['id'])
-                    log.info('Deleted unwanted auto-snapshot %s (vol %s not selected)', snap['id'][:8], vid[:8])
-                    conn = get_db()
-            conn.commit()
-            conn.close()
-
-        # ── Data disks WITHOUT system: explicit EVS snapshots ────────────────
-        # (If system was included, auto-snapshots already cover data disks above)
-        if not system_vol and data_vols:
+        # ── Data disks: explicit EVS snapshots ──────────────────────────────
+        # Always create explicit EVS snapshots for data disks.
+        # (ECS createImage handles the system disk internally via IMS;
+        #  auto-created EVS snapshots from createImage are not reliably
+        #  available in this region within a reasonable polling window.)
+        if data_vols:
             if backup_row_id is None:
                 # No system image — create a placeholder backup_images row to anchor snapshots
                 ph_name = image_name + '-data'
