@@ -279,50 +279,29 @@ def fetch_ecs_volumes(ecs_id):
 
 # ── Backup Logic ──────────────────────────────────────────────────────────────
 
-def poll_image_active(image_id, timeout=600):
-    """Poll IMS until the image status becomes 'active'. Returns (ok, error_msg).
-    Uses list+filter because GET /v2/cloudimages/{id} is not published in sa-argentina-1 APIGW.
-    """
-    url = '%s/v2/cloudimages' % IMS_ENDPOINT
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = hwc_request('GET', url, params={'id': image_id, 'limit': '1'})
-            if r.status_code == 200:
-                imgs = r.json().get('images', [])
-                if imgs:
-                    status = imgs[0].get('status', '')
-                    if status == 'active':
-                        return True, None
-                    if status == 'error':
-                        return False, 'Image entered error state'
-            time.sleep(15)
-        except Exception as e:
-            log.warning('Poll image error: %s', e)
-            time.sleep(15)
-    return False, 'Timed out waiting for image to become active'
 
-def _create_data_disk_image(volume_id, name, description=''):
-    """Create an IMS image from a data disk volume via POST /v2/cloudimages/action.
-    Polls the async job, then patches virtual_env_type=DataImage. Returns image_id.
+def _create_volume_image(volume_id, name, os_version, description='', patch_data_image=False):
+    """Create an IMS image from a volume via POST /v2/cloudimages/action.
+    Polls the async job until SUCCESS. If patch_data_image=True, patches
+    virtual_env_type=DataImage after creation. Returns image_id.
     """
     project_id = get_project_id()
     body = {
         'name': name,
         'volume_id': volume_id,
-        'os_version': 'Other Linux(64 bit)',
+        'os_version': os_version,
         'description': description,
     }
     r = hwc_request('POST', '%s/v2/cloudimages/action' % IMS_ENDPOINT, body=body)
     if r.status_code not in (200, 202):
-        raise Exception('Data disk image create HTTP %s: %s' % (r.status_code, r.text[:200]))
+        raise Exception('Volume image create HTTP %s: %s' % (r.status_code, r.text[:200]))
     job_id = r.json().get('job_id')
     if not job_id:
-        raise Exception('No job_id in data disk image create response')
+        raise Exception('No job_id in volume image create response')
 
     # Poll job until SUCCESS
     job_url = '%s/v1/%s/jobs/%s' % (IMS_ENDPOINT, project_id, job_id)
-    deadline = time.time() + 600
+    deadline = time.time() + 1800
     while time.time() < deadline:
         jr = hwc_request('GET', job_url)
         if jr.status_code == 200:
@@ -332,17 +311,19 @@ def _create_data_disk_image(volume_id, name, description=''):
                 image_id = j.get('entities', {}).get('image_id')
                 if not image_id:
                     raise Exception('No image_id in job result')
-                # Patch virtual_env_type → DataImage so console shows it correctly
-                patch = [{'op': 'replace', 'path': '/virtual_env_type', 'value': 'DataImage'}]
-                hwc_request('PATCH', '%s/v2/images/%s' % (IMS_ENDPOINT, image_id),
-                            body=patch,
-                            content_type='application/openstack-images-v2.1-json-patch')
-                log.info('Data disk image created and patched: %s', image_id)
+                if patch_data_image:
+                    patch = [{'op': 'replace', 'path': '/virtual_env_type', 'value': 'DataImage'}]
+                    hwc_request('PATCH', '%s/v2/images/%s' % (IMS_ENDPOINT, image_id),
+                                body=patch,
+                                content_type='application/openstack-images-v2.1-json-patch')
+                    log.info('Data disk image created and patched: %s', image_id)
+                else:
+                    log.info('System disk image created: %s', image_id)
                 return image_id
             if status == 'FAIL':
-                raise Exception('Data disk image job failed: %s' % j.get('fail_reason'))
+                raise Exception('Volume image job failed: %s' % j.get('fail_reason'))
         time.sleep(15)
-    raise Exception('Data disk image job timed out (job_id=%s)' % job_id)
+    raise Exception('Volume image job timed out (job_id=%s)' % job_id)
 
 def _register_data_image(conn, backup_row_id, schedule_id, ecs_id, image_id, image_name, volume_id, size_gb):
     """Register a data disk IMS image in backup_snapshots table."""
@@ -467,22 +448,24 @@ def run_backup(schedule_id):
         image_id    = None
         backup_row_id = None
 
-        # ── System disk: ECS createImage → IMS system disk image ────────────
+        # ── System disk: IMS image via volume_id (correct min_disk) ─────────
         if system_vol:
-            url = '%s/v2/%s/servers/%s/action' % (ECS_ENDPOINT, project_id, sched['ecs_id'])
-            r = hwc_request('POST', url, body={'createImage': {'name': image_name, 'description': description}})
-            if r.status_code not in (200, 202):
-                raise Exception('ECS createImage HTTP %s: %s' % (r.status_code, r.text[:300]))
-
-            location = r.headers.get('Location', '')
-            image_id = location.rstrip('/').split('/')[-1] if location else None
-            if not image_id:
-                raise Exception('No Location header in createImage response')
-            log.info('System image creation started: image_id=%s', image_id)
-
-            ok, err = poll_image_active(image_id)
-            if not ok:
-                raise Exception('Image polling failed: %s' % err)
+            # Detect OS version from ECS image metadata
+            sys_os_version = 'Other Linux(64 bit)'
+            try:
+                er = hwc_request('GET', '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, sched['ecs_id']))
+                src_img_id = er.json().get('server', {}).get('image', {}).get('id', '')
+                if src_img_id:
+                    ir = hwc_request('GET', '%s/v2/cloudimages' % IMS_ENDPOINT,
+                                     params={'id': src_img_id, 'limit': '1'})
+                    imgs = ir.json().get('images', [])
+                    if imgs:
+                        sys_os_version = imgs[0].get('__os_version', sys_os_version)
+            except Exception:
+                pass
+            log.info('Creating system disk image from volume %s os=%s', system_vol['id'][:8], sys_os_version)
+            image_id = _create_volume_image(system_vol['id'], image_name, sys_os_version,
+                                            description=description, patch_data_image=False)
 
             finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             conn = get_db()
@@ -514,7 +497,8 @@ def run_backup(schedule_id):
                 dv_safe = ''.join(c if c.isalnum() or c=='-' else '-' for c in dv.get('name','vol'))[:20]
                 dv_img_name = 'bkp-data-%s-%s' % (dv_safe, ts)
                 log.info('Creating IMS image for data disk %s (%s GB)', dv['id'][:8], dv.get('size'))
-                dv_image_id = _create_data_disk_image(dv['id'], dv_img_name, description)
+                dv_image_id = _create_volume_image(dv['id'], dv_img_name, 'Other Linux(64 bit)',
+                                                   description=description, patch_data_image=True)
                 conn = get_db()
                 _register_data_image(conn, backup_row_id, schedule_id, sched['ecs_id'],
                                      dv_image_id, dv_img_name, dv['id'], dv.get('size'))
