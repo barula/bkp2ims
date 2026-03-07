@@ -1072,7 +1072,7 @@ async function loadHistory() {
         ? `&middot; ` + relSnaps.map(s => {
             const role = s.volume_role === 'system' ? 'Sistema' : 'Datos';
             const cls  = s.volume_role === 'system' ? 'badge-info' : 'badge-warning';
-            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB EVS</span>`;
+            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB IMS</span>`;
           }).join(' ')
         : '';
       return `

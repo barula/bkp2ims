@@ -76,7 +76,7 @@ def get_project_id():
 #  - X-Security-Token: pass as header but DO NOT include in SignedHeaders
 #  - SK used directly (no key derivation, unlike AWS v4)
 
-def hwc_request(method, url, body=None, params=None):
+def hwc_request(method, url, body=None, params=None, content_type='application/json'):
     cred = get_credentials()
     ak, sk, token = cred['ak'], cred['sk'], cred['token']
 
@@ -107,7 +107,7 @@ def hwc_request(method, url, body=None, params=None):
 
     # Only sign: content-type, host, x-sdk-date (NOT x-security-token)
     headers_to_sign = {
-        'content-type': 'application/json',
+        'content-type': content_type,
         'host': host,
         'x-sdk-date': timestamp,
     }
@@ -149,7 +149,7 @@ def hwc_request(method, url, body=None, params=None):
     req_headers = {
         'X-Sdk-Date': timestamp,
         'Authorization': auth,
-        'Content-Type': 'application/json',
+        'Content-Type': content_type,
         'X-Security-Token': token,
     }
 
@@ -175,6 +175,7 @@ def init_db():
     for migration in [
         'ALTER TABLE schedules ADD COLUMN selected_volumes TEXT DEFAULT "[]"',
         'ALTER TABLE backup_snapshots ADD COLUMN volume_role TEXT DEFAULT "data"',
+        'ALTER TABLE backup_snapshots ADD COLUMN backup_type TEXT DEFAULT "ims_image"',
     ]:
         try:
             conn.execute(migration)
@@ -227,6 +228,7 @@ def init_db():
             snapshot_name TEXT,
             volume_id TEXT,
             volume_role TEXT DEFAULT "data",
+            backup_type TEXT DEFAULT "ims_image",
             size_gb INTEGER,
             created_at TEXT NOT NULL,
             deleted INTEGER DEFAULT 0
@@ -300,96 +302,102 @@ def poll_image_active(image_id, timeout=600):
             time.sleep(15)
     return False, 'Timed out waiting for image to become active'
 
-def _create_evs_snapshot(volume_id, name, description=''):
-    """Create an EVS snapshot and wait for it to be available. Returns snapshot dict or raises."""
+def _create_data_disk_image(volume_id, name, description=''):
+    """Create an IMS image from a data disk volume via POST /v2/cloudimages/action.
+    Polls the async job, then patches virtual_env_type=DataImage. Returns image_id.
+    """
     project_id = get_project_id()
-    payload = {'snapshot': {'volume_id': volume_id, 'name': name, 'description': description, 'force': True}}
-    r = hwc_request('POST', '%s/v2/%s/snapshots' % (EVS_ENDPOINT, project_id), body=payload)
+    body = {
+        'name': name,
+        'volume_id': volume_id,
+        'os_version': 'Other Linux(64 bit)',
+        'description': description,
+    }
+    r = hwc_request('POST', '%s/v2/cloudimages/action' % IMS_ENDPOINT, body=body)
     if r.status_code not in (200, 202):
-        raise Exception('EVS snapshot create HTTP %s: %s' % (r.status_code, r.text[:200]))
-    snap = r.json()['snapshot']
-    snap_id = snap['id']
-    # Poll until available
-    deadline = time.time() + 300
+        raise Exception('Data disk image create HTTP %s: %s' % (r.status_code, r.text[:200]))
+    job_id = r.json().get('job_id')
+    if not job_id:
+        raise Exception('No job_id in data disk image create response')
+
+    # Poll job until SUCCESS
+    job_url = '%s/v1/%s/jobs/%s' % (IMS_ENDPOINT, project_id, job_id)
+    deadline = time.time() + 600
     while time.time() < deadline:
-        pr = hwc_request('GET', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap_id))
-        if pr.status_code == 200:
-            s = pr.json()['snapshot']
-            if s['status'] == 'available':
-                return s
-            if s['status'] == 'error':
-                raise Exception('EVS snapshot %s entered error state' % snap_id)
-        time.sleep(10)
-    raise Exception('EVS snapshot %s timed out' % snap_id)
+        jr = hwc_request('GET', job_url)
+        if jr.status_code == 200:
+            j = jr.json()
+            status = j.get('status', '')
+            if status == 'SUCCESS':
+                image_id = j.get('entities', {}).get('image_id')
+                if not image_id:
+                    raise Exception('No image_id in job result')
+                # Patch virtual_env_type → DataImage so console shows it correctly
+                patch = [{'op': 'replace', 'path': '/virtual_env_type', 'value': 'DataImage'}]
+                hwc_request('PATCH', '%s/v2/images/%s' % (IMS_ENDPOINT, image_id),
+                            body=patch,
+                            content_type='application/openstack-images-v2.1-json-patch')
+                log.info('Data disk image created and patched: %s', image_id)
+                return image_id
+            if status == 'FAIL':
+                raise Exception('Data disk image job failed: %s' % j.get('fail_reason'))
+        time.sleep(15)
+    raise Exception('Data disk image job timed out (job_id=%s)' % job_id)
 
-def _find_auto_snapshots(image_name):
-    """Find auto-created EVS snapshots matching 'snapshot for {image_name}'."""
-    project_id = get_project_id()
-    snap_name = 'snapshot for %s' % image_name
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        r = hwc_request('GET', '%s/v2/%s/snapshots/detail' % (EVS_ENDPOINT, project_id),
-                        params={'name': snap_name})
-        if r.status_code == 200:
-            snaps = r.json().get('snapshots', [])
-            if snaps:
-                return snaps
-        time.sleep(10)
-    return []
-
-def _delete_snapshot(snap_id):
-    project_id = get_project_id()
-    r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap_id))
-    return r.status_code in (200, 202, 204)
-
-def _register_snapshot(conn, backup_row_id, schedule_id, ecs_id, snap, role):
+def _register_data_image(conn, backup_row_id, schedule_id, ecs_id, image_id, image_name, volume_id, size_gb):
+    """Register a data disk IMS image in backup_snapshots table."""
+    now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     conn.execute(
         'INSERT OR IGNORE INTO backup_snapshots '
-        '(backup_image_id, schedule_id, ecs_id, snapshot_id, snapshot_name, volume_id, volume_role, size_gb, created_at) '
-        'VALUES (?,?,?,?,?,?,?,?,?)',
+        '(backup_image_id, schedule_id, ecs_id, snapshot_id, snapshot_name, volume_id, volume_role, backup_type, size_gb, created_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?)',
         (backup_row_id, schedule_id, ecs_id,
-         snap['id'], snap['name'], snap['volume_id'], role,
-         snap.get('size', 0),
-         snap.get('created_at', datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))[:19] + 'Z')
+         image_id, image_name, volume_id, 'data', 'ims_image',
+         size_gb or 0, now_str)
     )
 
 def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
-    """Delete an IMS image and all its associated EVS snapshots."""
-    project_id = get_project_id()
-    # Delete IMS image
-    try:
-        r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, img_id))
-        if r.status_code in (200, 204):
-            log.info('Deleted IMS image %s (%s)', img_id, img_name)
-            conn = get_db()
-            conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
-            conn.commit()
-            conn.close()
-        else:
-            log.warning('Delete IMS image %s: HTTP %s %s', img_id, r.status_code, r.text[:150])
-    except Exception as e:
-        log.error('Delete IMS image %s error: %s', img_id, e)
-
-    # Delete associated EVS snapshots
-    conn = get_db()
-    snaps = conn.execute(
-        'SELECT snapshot_id, snapshot_name FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
-        (backup_image_row_id,)
-    ).fetchall()
-    conn.close()
-    for snap in snaps:
+    """Delete an IMS image and all its associated data disk IMS images."""
+    # Delete system disk IMS image (skip placeholder 'data-only' entries)
+    if img_id and img_id != 'data-only':
         try:
-            r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap['snapshot_id']))
-            if r.status_code in (200, 202, 204):
-                log.info('Deleted EVS snapshot %s (%s)', snap['snapshot_id'], snap['snapshot_name'])
+            r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, img_id))
+            if r.status_code in (200, 204):
+                log.info('Deleted IMS image %s (%s)', img_id, img_name)
                 conn = get_db()
-                conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (snap['snapshot_id'],))
+                conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
                 conn.commit()
                 conn.close()
             else:
-                log.warning('Delete snapshot %s: HTTP %s %s', snap['snapshot_id'], r.status_code, r.text[:150])
+                log.warning('Delete IMS image %s: HTTP %s %s', img_id, r.status_code, r.text[:150])
         except Exception as e:
-            log.error('Delete snapshot %s error: %s', snap['snapshot_id'], e)
+            log.error('Delete IMS image %s error: %s', img_id, e)
+
+    # Delete associated data disk IMS images
+    conn = get_db()
+    items = conn.execute(
+        'SELECT snapshot_id, snapshot_name, backup_type FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+        (backup_image_row_id,)
+    ).fetchall()
+    conn.close()
+    for item in items:
+        try:
+            # All new items are ims_image; legacy evs_snapshot items use EVS DELETE
+            if item['backup_type'] == 'evs_snapshot':
+                project_id = get_project_id()
+                r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, item['snapshot_id']))
+            else:
+                r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, item['snapshot_id']))
+            if r.status_code in (200, 202, 204):
+                log.info('Deleted data item %s (%s)', item['snapshot_id'], item['snapshot_name'])
+                conn = get_db()
+                conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (item['snapshot_id'],))
+                conn.commit()
+                conn.close()
+            else:
+                log.warning('Delete data item %s: HTTP %s %s', item['snapshot_id'], r.status_code, r.text[:150])
+        except Exception as e:
+            log.error('Delete data item %s error: %s', item['snapshot_id'], e)
 
 def apply_retention(schedule_id, ecs_id, retention_count):
     """Delete oldest backup images (+ snapshots) beyond retention_count for this schedule."""
@@ -453,8 +461,8 @@ def run_backup(schedule_id):
             vol_lines.append('%s | %s | %s | %s GB | %s | %s' % (
                 v.get('device','-'), v.get('name','-'), v.get('type','-'),
                 v.get('size','?'), v.get('status','-'), rol))
-        description = 'Backup automatico. Programacion: %s\nDiscos:\n%s' % (
-            sched['name'], '\n'.join(vol_lines) if vol_lines else '-')
+        description = ('Backup automatico. Programacion: %s. Discos: %s' % (
+            sched['name'], ' | '.join(vol_lines) if vol_lines else '-'))[:255]
 
         image_id    = None
         backup_row_id = None
@@ -487,14 +495,10 @@ def run_backup(schedule_id):
             conn.close()
             log.info('System disk image registered: image_id=%s', image_id)
 
-        # ── Data disks: explicit EVS snapshots ──────────────────────────────
-        # Always create explicit EVS snapshots for data disks.
-        # (ECS createImage handles the system disk internally via IMS;
-        #  auto-created EVS snapshots from createImage are not reliably
-        #  available in this region within a reasonable polling window.)
+        # ── Data disks: IMS image via POST /v2/cloudimages/action ───────────
         if data_vols:
             if backup_row_id is None:
-                # No system image — create a placeholder backup_images row to anchor snapshots
+                # No system image — create a placeholder backup_images row to anchor data images
                 ph_name = image_name + '-data'
                 finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
                 conn = get_db()
@@ -507,22 +511,22 @@ def run_backup(schedule_id):
                 conn.close()
 
             for dv in data_vols:
-                snap_name = 'bkp-data-%s-%s' % (
-                    ''.join(c if c.isalnum() or c=='-' else '-' for c in dv.get('name','vol'))[:20],
-                    datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S'))
-                log.info('Creating EVS snapshot for data disk %s (%s GB)', dv['id'][:8], dv.get('size'))
-                snap = _create_evs_snapshot(dv['id'], snap_name, description)
+                dv_safe = ''.join(c if c.isalnum() or c=='-' else '-' for c in dv.get('name','vol'))[:20]
+                dv_img_name = 'bkp-data-%s-%s' % (dv_safe, ts)
+                log.info('Creating IMS image for data disk %s (%s GB)', dv['id'][:8], dv.get('size'))
+                dv_image_id = _create_data_disk_image(dv['id'], dv_img_name, description)
                 conn = get_db()
-                _register_snapshot(conn, backup_row_id, schedule_id, sched['ecs_id'], snap, 'data')
+                _register_data_image(conn, backup_row_id, schedule_id, sched['ecs_id'],
+                                     dv_image_id, dv_img_name, dv['id'], dv.get('size'))
                 conn.commit()
                 conn.close()
-                log.info('Data disk snapshot created: %s', snap['id'][:8])
+                log.info('Data disk IMS image registered: %s', dv_image_id[:8])
 
         # ── Finalize job history ─────────────────────────────────────────────
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         msg = 'Sistema: imagen IMS' if system_vol else ''
         if data_vols:
-            msg += ('%s | ' % (' + ' if msg else '')) + 'Datos: %d snapshot(s) EVS' % len(data_vols)
+            msg += ('%s | ' % (' + ' if msg else '')) + 'Datos: %d imagen(es) IMS' % len(data_vols)
         conn = get_db()
         conn.execute(
             'UPDATE job_history SET status=?, image_id=?, image_name=?, finished_at=?, message=? WHERE id=?',
