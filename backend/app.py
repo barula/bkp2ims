@@ -432,6 +432,11 @@ def run_backup(schedule_id):
         else:
             target_vols = all_vols
 
+        if not all_vols:
+            raise Exception('No se pudieron obtener los volúmenes de la ECS (API vacía o error de red)')
+        if not target_vols:
+            raise Exception('Ningún volumen seleccionado coincide con los discos actuales de la ECS')
+
         system_vol = next((v for v in target_vols if v.get('bootable') == 'true'), None)
         data_vols  = [v for v in target_vols if v.get('bootable') != 'true']
 
