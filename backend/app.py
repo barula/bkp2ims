@@ -468,8 +468,14 @@ def run_backup(schedule_id):
         if not target_vols:
             raise Exception('Ningún volumen seleccionado coincide con los discos actuales de la ECS')
 
-        system_vol = next((v for v in target_vols if v.get('bootable') == 'true'), None)
-        data_vols  = [v for v in target_vols if v.get('bootable') != 'true']
+        # Identify system disk by device path (/dev/vda is always system on HWC KVM).
+        # Do NOT rely on bootable=true — HWC sets that flag on all volumes attached
+        # to an ECS that was booted from an image, including data disks.
+        system_vol = next((v for v in target_vols if v.get('device') == '/dev/vda'), None)
+        # Fallback: if no /dev/vda found, use bootable flag
+        if system_vol is None:
+            system_vol = next((v for v in target_vols if v.get('bootable') == 'true'), None)
+        data_vols  = [v for v in target_vols if v is not system_vol]
 
         # Build description
         vol_lines = []
@@ -618,11 +624,18 @@ def stop_ecs_and_wait(ecs_id):
     log.info('ECS %s stopped', ecs_id[:8])
 
 def start_ecs_and_wait(ecs_id):
-    """Start ECS and wait until ACTIVE."""
+    """Start ECS and wait until ACTIVE. No-op if already running."""
+    status = get_ecs_status(ecs_id)
+    if status == 'ACTIVE':
+        log.info('ECS %s already ACTIVE, nothing to do', ecs_id[:8])
+        return
     project_id = get_project_id()
     r = hwc_request('POST', '%s/v2/%s/servers/%s/action' % (ECS_ENDPOINT, project_id, ecs_id),
                     body={'os-start': {}})
-    if r.status_code not in (200, 202, 204):
+    # 409 means the ECS is already starting/running — treat as success
+    if r.status_code == 409:
+        log.info('ECS %s already starting (409), waiting for ACTIVE', ecs_id[:8])
+    elif r.status_code not in (200, 202, 204):
         raise Exception('Start ECS HTTP %s: %s' % (r.status_code, r.text[:200]))
     wait_ecs_state(ecs_id, 'ACTIVE', timeout=300)
     log.info('ECS %s started', ecs_id[:8])
