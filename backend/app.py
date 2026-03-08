@@ -294,18 +294,19 @@ def fetch_ecs_volumes(ecs_id):
 # ── Backup Logic ──────────────────────────────────────────────────────────────
 
 
-def _create_volume_image(volume_id, name, os_version, description='', patch_data_image=False):
-    """Create an IMS image from a volume via POST /v2/cloudimages/action.
+def _create_volume_image(volume_id, name, os_version, description='', patch_data_image=False, instance_id=None):
+    """Create an IMS image via POST /v2/cloudimages/action.
+    If instance_id is provided, creates image from the ECS instance (system disk,
+    works with Marketplace images). Otherwise creates from volume_id (data disks).
     Polls the async job until SUCCESS. If patch_data_image=True, patches
     virtual_env_type=DataImage after creation. Returns image_id.
     """
     project_id = get_project_id()
-    body = {
-        'name': name,
-        'volume_id': volume_id,
-        'os_version': os_version,
-        'description': description,
-    }
+    body = {'name': name, 'os_version': os_version, 'description': description}
+    if instance_id:
+        body['instance_id'] = instance_id
+    else:
+        body['volume_id'] = volume_id
     r = hwc_request('POST', '%s/v2/cloudimages/action' % IMS_ENDPOINT, body=body)
     if r.status_code not in (200, 202):
         raise Exception('Volume image create HTTP %s: %s' % (r.status_code, r.text[:200]))
@@ -505,9 +506,10 @@ def run_backup(schedule_id):
                         sys_os_version = imgs[0].get('__os_version', sys_os_version)
             except Exception:
                 pass
-            log.info('Creating system disk image from volume %s os=%s', system_vol['id'][:8], sys_os_version)
-            image_id = _create_volume_image(system_vol['id'], image_name, sys_os_version,
-                                            description=description, patch_data_image=False)
+            log.info('Creating system disk image from instance %s os=%s', sched['ecs_id'][:8], sys_os_version)
+            image_id = _create_volume_image(None, image_name, sys_os_version,
+                                            description=description, patch_data_image=False,
+                                            instance_id=sched['ecs_id'])
 
             finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             conn = get_db()
