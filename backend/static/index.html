@@ -275,6 +275,8 @@
   .btn-ghost:hover { background: var(--bg); color: var(--text); }
   .btn-danger { background: transparent; color: var(--error); border-color: var(--border); }
   .btn-danger:hover { background: var(--error-bg); border-color: var(--error); }
+  .btn-restore { background: transparent; color: var(--warning); border-color: var(--border); }
+  .btn-restore:hover { background: var(--warning-bg); border-color: var(--warning); }
   .btn-sm { padding: 4px 10px; font-size: 12px; }
   .btn-icon { padding: 6px; border-radius: var(--radius-sm); }
   .toggle-btn {
@@ -522,7 +524,7 @@
   <div id="tab-history" class="section">
     <div class="section-toolbar">
       <span class="section-title">Historial de backups</span>
-      <button class="btn btn-ghost btn-sm" onclick="loadHistory()">
+      <button class="btn btn-ghost btn-sm" onclick="loadHistory(); loadRestoreHistory();">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
         Actualizar
       </button>
@@ -530,8 +532,36 @@
     <div class="card">
       <div id="history-container" style="padding: 20px;"></div>
     </div>
+    <div class="card" style="margin-top:12px">
+      <div class="card-header">
+        <h2>Historial de restauraciones</h2>
+      </div>
+      <div id="restore-history-container" style="padding: 20px;"></div>
+    </div>
   </div>
 </main>
+
+<!-- ── Modal: Restore Confirmation ── -->
+<div id="restore-modal-backdrop" class="modal-backdrop">
+  <div class="modal" style="max-width:440px">
+    <div class="modal-header">
+      <h3>Confirmar restauracion</h3>
+      <button class="close-btn" onclick="closeRestoreModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div style="background:var(--warning-bg);border:1px solid var(--warning);border-radius:var(--radius-sm);padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--warning);">
+        <strong>Atencion:</strong> La ECS sera detenida automaticamente durante la restauracion. Los discos actuales seran reemplazados con el contenido del backup seleccionado.
+      </div>
+      <div id="restore-modal-info" style="font-size:13px;line-height:1.8;"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeRestoreModal()">Cancelar</button>
+      <button class="btn btn-danger" onclick="executeRestore()" id="btn-confirm-restore">Restaurar</button>
+    </div>
+  </div>
+</div>
 
 <!-- ── Modal: New/Edit Schedule ── -->
 <div id="modal-backdrop" class="modal-backdrop">
@@ -632,7 +662,7 @@ function switchTab(name) {
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
   document.getElementById(`tab-${name}`).classList.add('active');
   if (name === 'schedules') loadSchedules();
-  if (name === 'history') loadHistory();
+  if (name === 'history') { loadHistory(); loadRestoreHistory(); }
 }
 
 // ── ECS ────────────────────────────────────────────────────────────────────
@@ -1045,18 +1075,22 @@ async function loadHistory() {
   const c = document.getElementById('history-container');
   c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
   try {
-    const [hr, sr] = await Promise.all([
+    const [hr, sr, ir] = await Promise.all([
       fetch(`${API}/api/history?limit=60`),
       fetch(`${API}/api/snapshots`),
+      fetch(`${API}/api/images`),
     ]);
     const items = (await hr.json()).history || [];
     const snaps = (await sr.json()).snapshots || [];
+    const imgs  = (await ir.json()).images || [];
 
-    // Group snapshots by backup_image_id (mapped via image_id in job_history)
-    // We'll group by image_name since that's the common key
+    // Map image_id -> backup_images row (for restore button)
+    const imagesByImageId = {};
+    imgs.forEach(img => { imagesByImageId[img.image_id] = img; });
+
+    // Group snapshots by backup_image_id
     const snapsByImageName = {};
     snaps.forEach(s => {
-      // snapshot_name = "snapshot for {image_name}"
       const imgName = s.snapshot_name.replace(/^snapshot for /, '');
       if (!snapsByImageName[imgName]) snapsByImageName[imgName] = [];
       snapsByImageName[imgName].push(s);
@@ -1075,6 +1109,10 @@ async function loadHistory() {
             return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB IMS</span>`;
           }).join(' ')
         : '';
+      const bkpImg = h.image_id ? imagesByImageId[h.image_id] : null;
+      const restoreBtn = (h.status === 'success' && bkpImg)
+        ? `<button class="btn btn-restore btn-sm" onclick="confirmRestore(${bkpImg.id}, '${esc(h.ecs_name)}', '${esc(h.image_name)}')">Restaurar</button>`
+        : '';
       return `
       <div class="history-item">
         ${statusIcon(h.status)}
@@ -1087,9 +1125,82 @@ async function loadHistory() {
             ${h.message && h.status !== 'success' ? `&middot; ${esc(h.message.slice(0,120))}` : ''}
           </div>
         </div>
-        <div class="history-time">${fmtDate(h.started_at)}</div>
+        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          ${restoreBtn}
+          <div class="history-time">${fmtDate(h.started_at)}</div>
+        </div>
       </div>`;
     }).join('');
+  } catch(e) {
+    c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
+  }
+}
+
+// ── Restore ─────────────────────────────────────────────────────────────────
+let pendingRestoreId = null;
+
+function confirmRestore(backupImageId, ecsName, imageName) {
+  pendingRestoreId = backupImageId;
+  document.getElementById('restore-modal-info').innerHTML =
+    `<strong>ECS:</strong> ${esc(ecsName)}<br><strong>Backup:</strong> ${esc(imageName)}`;
+  document.getElementById('restore-modal-backdrop').classList.add('visible');
+}
+
+function closeRestoreModal() {
+  pendingRestoreId = null;
+  document.getElementById('restore-modal-backdrop').classList.remove('visible');
+  const btn = document.getElementById('btn-confirm-restore');
+  btn.disabled = false;
+  btn.textContent = 'Restaurar';
+}
+
+async function executeRestore() {
+  if (!pendingRestoreId) return;
+  const btn = document.getElementById('btn-confirm-restore');
+  btn.disabled = true;
+  btn.textContent = 'Iniciando...';
+  try {
+    const r = await fetch(`${API}/api/restore/${pendingRestoreId}`, {method: 'POST'});
+    const data = await r.json();
+    if (data.ok) {
+      toast('Restauracion iniciada. La ECS se detendrá y restaurará en segundo plano.', 'success');
+      closeRestoreModal();
+      setTimeout(loadRestoreHistory, 2000);
+    } else {
+      toast('Error: ' + (data.error || 'desconocido'), 'error');
+      btn.disabled = false;
+      btn.textContent = 'Restaurar';
+    }
+  } catch(e) {
+    toast('Error: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Restaurar';
+  }
+}
+
+async function loadRestoreHistory() {
+  const c = document.getElementById('restore-history-container');
+  if (!c) return;
+  c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  try {
+    const r = await fetch(`${API}/api/restore_history?limit=30`);
+    const items = (await r.json()).restore_history || [];
+    if (!items.length) {
+      c.innerHTML = '<div class="empty"><p>Sin historial de restauraciones</p></div>';
+      return;
+    }
+    c.innerHTML = items.map(h => `
+      <div class="history-item">
+        ${statusIcon(h.status)}
+        <div class="history-body">
+          <div class="history-title">${esc(h.ecs_name || '—')}</div>
+          <div class="history-sub">
+            <span class="badge ${h.status==='success'?'badge-active':h.status==='failed'?'badge-error':'badge-running'}">${h.status}</span>
+            ${h.message ? `&middot; ${esc(h.message.slice(0,150))}` : ''}
+          </div>
+        </div>
+        <div class="history-time">${fmtDate(h.started_at)}</div>
+      </div>`).join('');
   } catch(e) {
     c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
   }
@@ -1101,9 +1212,12 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// Close modal on backdrop click
+// Close modals on backdrop click
 document.getElementById('modal-backdrop').addEventListener('click', e => {
   if (e.target === e.currentTarget) closeModal();
+});
+document.getElementById('restore-modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeRestoreModal();
 });
 
 // Keyboard shortcut
