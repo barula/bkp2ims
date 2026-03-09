@@ -899,6 +899,20 @@ async function deleteSchedule(id, name) {
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 
+async function deleteBackup(backupId, name) {
+  if (!confirm(`Eliminar backup "${name}"?\nSe eliminarán los backups VBS asociados.`)) return;
+  try {
+    const r = await fetch(`${API}/api/images/${backupId}`, {method:'DELETE'});
+    const data = await r.json();
+    if (data.ok) {
+      toast('Backup eliminado');
+      loadHistory();
+    } else {
+      toast('Error: ' + (data.error || 'desconocido'), 'error');
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
 // ── Modal ──────────────────────────────────────────────────────────────────
 function onFreqPreset() {
   const v = document.getElementById('f-freq-preset').value;
@@ -1084,16 +1098,15 @@ async function loadHistory() {
     const snaps = (await sr.json()).snapshots || [];
     const imgs  = (await ir.json()).images || [];
 
-    // Map image_id -> backup_images row (for restore button)
+    // Map image_id -> backup_images row (for restore/delete buttons)
     const imagesByImageId = {};
     imgs.forEach(img => { imagesByImageId[img.image_id] = img; });
 
-    // Group snapshots by backup_image_id
-    const snapsByImageName = {};
+    // Group disk backup entries by backup_image_id (row id)
+    const snapsByBkpId = {};
     snaps.forEach(s => {
-      const imgName = s.snapshot_name.replace(/^snapshot for /, '');
-      if (!snapsByImageName[imgName]) snapsByImageName[imgName] = [];
-      snapsByImageName[imgName].push(s);
+      if (!snapsByBkpId[s.backup_image_id]) snapsByBkpId[s.backup_image_id] = [];
+      snapsByBkpId[s.backup_image_id].push(s);
     });
 
     if (!items.length) {
@@ -1101,17 +1114,20 @@ async function loadHistory() {
       return;
     }
     c.innerHTML = items.map(h => {
-      const relSnaps = h.image_name ? (snapsByImageName[h.image_name] || []) : [];
+      const bkpImg = h.image_id ? imagesByImageId[h.image_id] : null;
+      const relSnaps = bkpImg ? (snapsByBkpId[bkpImg.id] || []) : [];
       const snapInfo = relSnaps.length
         ? `&middot; ` + relSnaps.map(s => {
-            const role = s.volume_role === 'system' ? 'Sistema' : 'Datos';
-            const cls  = s.volume_role === 'system' ? 'badge-info' : 'badge-warning';
-            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB IMS</span>`;
+            const label = s.device || (s.volume_role === 'system' ? 'Sistema' : 'Datos');
+            const cls   = s.device === '/dev/vda' ? 'badge-info' : 'badge-warning';
+            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${label} ${s.size_gb}GB VBS</span>`;
           }).join(' ')
         : '';
-      const bkpImg = h.image_id ? imagesByImageId[h.image_id] : null;
       const restoreBtn = (h.status === 'success' && bkpImg)
         ? `<button class="btn btn-restore btn-sm" onclick="confirmRestore(${bkpImg.id}, '${esc(h.ecs_name)}', '${esc(h.image_name)}')">Restaurar</button>`
+        : '';
+      const deleteBtn = bkpImg
+        ? `<button class="btn btn-danger btn-sm" title="Eliminar backup" onclick="deleteBackup(${bkpImg.id}, '${esc(h.image_name)}')">&#x1F5D1;</button>`
         : '';
       return `
       <div class="history-item">
@@ -1127,6 +1143,7 @@ async function loadHistory() {
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
           ${restoreBtn}
+          ${deleteBtn}
           <div class="history-time">${fmtDate(h.started_at)}</div>
         </div>
       </div>`;

@@ -30,6 +30,7 @@ META_URL = 'http://169.254.169.254/openstack/latest/meta_data.json'
 ECS_ENDPOINT = 'https://ecs.{}.myhuaweicloud.com'.format(REGION)
 EVS_ENDPOINT = 'https://evs.{}.myhuaweicloud.com'.format(REGION)
 IMS_ENDPOINT = 'https://ims.{}.myhuaweicloud.com'.format(REGION)
+VBS_ENDPOINT = 'https://vbs.{}.myhuaweicloud.com'.format(REGION)
 
 # ── Credentials ──────────────────────────────────────────────────────────────
 
@@ -234,6 +235,7 @@ def init_db():
             backup_type TEXT DEFAULT "ims_image",
             size_gb INTEGER,
             device TEXT,
+            volume_type TEXT,
             created_at TEXT NOT NULL,
             deleted INTEGER DEFAULT 0
         );
@@ -254,7 +256,7 @@ def init_db():
 # ── Volume Helper ────────────────────────────────────────────────────────────
 
 def fetch_ecs_volumes(ecs_id):
-    """Return a list of volume dicts for the given ECS. Used for image description."""
+    """Return a list of volume dicts for the given ECS."""
     project_id = get_project_id()
     try:
         url = '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, ecs_id)
@@ -291,129 +293,214 @@ def fetch_ecs_volumes(ecs_id):
         log.warning('fetch_ecs_volumes error: %s', e)
         return []
 
-# ── Backup Logic ──────────────────────────────────────────────────────────────
+# ── EVS / VBS Primitives ──────────────────────────────────────────────────────
 
-
-def _create_volume_image(volume_id, name, os_version, description='', patch_data_image=False, instance_id=None):
-    """Create an IMS image via POST /v2/cloudimages/action.
-    If instance_id is provided, creates image from the ECS instance (system disk,
-    works with Marketplace images). Otherwise creates from volume_id (data disks).
-    Polls the async job until SUCCESS. If patch_data_image=True, patches
-    virtual_env_type=DataImage after creation. Returns image_id.
-    """
+def _poll_volume_status(vol_id, target_status, timeout=600):
+    """Poll EVS volume until it reaches target_status."""
     project_id = get_project_id()
-    body = {'name': name, 'os_version': os_version, 'description': description}
-    if instance_id:
-        body['instance_id'] = instance_id
-    else:
-        body['volume_id'] = volume_id
-    r = hwc_request('POST', '%s/v2/cloudimages/action' % IMS_ENDPOINT, body=body)
-    if r.status_code not in (200, 202):
-        raise Exception('Volume image create HTTP %s: %s' % (r.status_code, r.text[:200]))
-    job_id = r.json().get('job_id')
-    if not job_id:
-        raise Exception('No job_id in volume image create response')
+    url = '%s/v2/%s/volumes/%s' % (EVS_ENDPOINT, project_id, vol_id)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = hwc_request('GET', url)
+        if r.status_code == 200:
+            status = r.json().get('volume', {}).get('status', '')
+            if status == target_status:
+                return
+            if 'error' in status:
+                raise Exception('Volume %s in error state: %s' % (vol_id[:8], status))
+        time.sleep(10)
+    raise Exception('Volume %s did not reach %s within %ds' % (vol_id[:8], target_status, timeout))
 
-    # Poll job until SUCCESS
-    job_url = '%s/v1/%s/jobs/%s' % (IMS_ENDPOINT, project_id, job_id)
+def _evs_create_snapshot(vol_id, name, description=''):
+    """Create EVS snapshot with force=True (works on in-use volumes). Returns snapshot_id after available."""
+    project_id = get_project_id()
+    body = {'snapshot': {'volume_id': vol_id, 'name': name, 'description': description, 'force': True}}
+    r = hwc_request('POST', '%s/v2/%s/snapshots' % (EVS_ENDPOINT, project_id), body=body)
+    if r.status_code not in (200, 202):
+        raise Exception('Create snapshot HTTP %s: %s' % (r.status_code, r.text[:300]))
+    snap_id = r.json().get('snapshot', {}).get('id')
+    if not snap_id:
+        raise Exception('No snapshot id in response')
+    snap_url = '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap_id)
     deadline = time.time() + 1800
     while time.time() < deadline:
-        jr = hwc_request('GET', job_url)
-        if jr.status_code == 200:
-            j = jr.json()
-            status = j.get('status', '')
-            if status == 'SUCCESS':
-                image_id = j.get('entities', {}).get('image_id')
-                if not image_id:
-                    raise Exception('No image_id in job result')
-                if patch_data_image:
-                    patch = [{'op': 'replace', 'path': '/virtual_env_type', 'value': 'DataImage'}]
-                    hwc_request('PATCH', '%s/v2/images/%s' % (IMS_ENDPOINT, image_id),
-                                body=patch,
-                                content_type='application/openstack-images-v2.1-json-patch')
-                    log.info('Data disk image created and patched: %s', image_id)
-                else:
-                    log.info('System disk image created: %s', image_id)
-                return image_id
-            if status == 'FAIL':
-                raise Exception('Volume image job failed: %s' % j.get('fail_reason'))
+        sr = hwc_request('GET', snap_url)
+        if sr.status_code == 200:
+            status = sr.json().get('snapshot', {}).get('status', '')
+            if status == 'available':
+                return snap_id
+            if status == 'error':
+                raise Exception('Snapshot %s in error state' % snap_id[:8])
         time.sleep(15)
-    raise Exception('Volume image job timed out (job_id=%s)' % job_id)
+    raise Exception('Snapshot %s timed out' % snap_id[:8])
 
-def _backup_single_data_disk(dv, backup_row_id, schedule_id, ecs_id, ts, description):
-    """Create IMS image for one data disk and register it. Called in parallel threads."""
-    dv_safe = ''.join(c if c.isalnum() or c == '-' else '-' for c in dv.get('name', 'vol'))[:20]
-    dv_img_name = 'bkp-data-%s-%s' % (dv_safe, ts)
-    log.info('Creating IMS image for data disk %s (%s GB) device=%s',
-             dv['id'][:8], dv.get('size'), dv.get('device', ''))
-    dv_image_id = _create_volume_image(dv['id'], dv_img_name, 'Other Linux(64 bit)',
-                                       description=description, patch_data_image=True)
-    conn = get_db()
-    _register_data_image(conn, backup_row_id, schedule_id, ecs_id,
-                         dv_image_id, dv_img_name, dv['id'], dv.get('size'),
-                         dv.get('device', ''), dv.get('type', ''))
-    conn.commit()
-    conn.close()
-    log.info('Data disk IMS image registered: %s device=%s', dv_image_id[:8], dv.get('device', ''))
-    return dv_img_name
+def _evs_delete_snapshot(snap_id):
+    """Delete an EVS snapshot."""
+    project_id = get_project_id()
+    r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, snap_id))
+    if r.status_code not in (200, 202, 204, 404):
+        log.warning('Delete snapshot %s: HTTP %s %s', snap_id[:8], r.status_code, r.text[:150])
 
-def _register_data_image(conn, backup_row_id, schedule_id, ecs_id, image_id, image_name, volume_id, size_gb, device='', volume_type=''):
-    """Register a data disk IMS image in backup_snapshots table."""
+def _vbs_create_backup(vol_id, snap_id, name, description=''):
+    """Create VBS backup from snapshot. Returns backup_id after available."""
+    project_id = get_project_id()
+    body = {'backup': {'volume_id': vol_id, 'snapshot_id': snap_id, 'name': name, 'description': description}}
+    r = hwc_request('POST', '%s/v2/%s/backups' % (VBS_ENDPOINT, project_id), body=body)
+    if r.status_code not in (200, 202):
+        raise Exception('VBS backup HTTP %s: %s' % (r.status_code, r.text[:300]))
+    backup_id = r.json().get('backup', {}).get('id')
+    if not backup_id:
+        raise Exception('No backup id in VBS response')
+    bkp_url = '%s/v2/%s/backups/%s' % (VBS_ENDPOINT, project_id, backup_id)
+    deadline = time.time() + 3600
+    while time.time() < deadline:
+        br = hwc_request('GET', bkp_url)
+        if br.status_code == 200:
+            status = br.json().get('backup', {}).get('status', '')
+            if status == 'available':
+                return backup_id
+            if status == 'error':
+                raise Exception('VBS backup %s in error state' % backup_id[:8])
+        time.sleep(30)
+    raise Exception('VBS backup %s timed out' % backup_id[:8])
+
+def _vbs_restore_disk(backup_id, vol_id):
+    """Restore VBS backup in-place to volume. Volume must be available (detached)."""
+    project_id = get_project_id()
+    url = '%s/v2/%s/backups/%s/restore' % (VBS_ENDPOINT, project_id, backup_id)
+    body = {'restore': {'volume_id': vol_id}}
+    r = hwc_request('POST', url, body=body)
+    if r.status_code not in (200, 202):
+        raise Exception('VBS restore HTTP %s: %s' % (r.status_code, r.text[:300]))
+    _poll_volume_status(vol_id, 'available', timeout=600)
+    log.info('VBS backup %s restored to volume %s', backup_id[:8], vol_id[:8])
+
+def _detach_volume_and_wait(ecs_id, vol_id, timeout=300):
+    """Detach volume from ECS and wait until available."""
+    project_id = get_project_id()
+    url = '%s/v2/%s/servers/%s/os-volume_attachments/%s' % (ECS_ENDPOINT, project_id, ecs_id, vol_id)
+    r = hwc_request('DELETE', url)
+    if r.status_code not in (200, 202, 204):
+        raise Exception('Detach volume %s HTTP %s: %s' % (vol_id[:8], r.status_code, r.text[:200]))
+    _poll_volume_status(vol_id, 'available', timeout=timeout)
+    log.info('Volume %s detached', vol_id[:8])
+
+def _attach_volume_and_wait(ecs_id, vol_id, device, timeout=120):
+    """Attach volume to ECS at given device path and wait until in-use."""
+    project_id = get_project_id()
+    url = '%s/v2/%s/servers/%s/os-volume_attachments' % (ECS_ENDPOINT, project_id, ecs_id)
+    body = {'volumeAttachment': {'volumeId': vol_id, 'device': device}}
+    r = hwc_request('POST', url, body=body)
+    if r.status_code not in (200, 202):
+        raise Exception('Attach volume %s HTTP %s: %s' % (vol_id[:8], r.status_code, r.text[:200]))
+    _poll_volume_status(vol_id, 'in-use', timeout=timeout)
+    log.info('Volume %s attached at %s', vol_id[:8], device)
+
+# ── VBS Backup Pipeline ───────────────────────────────────────────────────────
+
+def _register_disk_backup(conn, backup_row_id, schedule_id, ecs_id, backup_id, backup_name,
+                          volume_id, size_gb, device='', volume_type=''):
+    """Register a VBS backup entry in backup_snapshots table."""
     now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     conn.execute(
-        'INSERT OR IGNORE INTO backup_snapshots '
+        'INSERT INTO backup_snapshots '
         '(backup_image_id, schedule_id, ecs_id, snapshot_id, snapshot_name, volume_id, volume_role, backup_type, size_gb, device, volume_type, created_at) '
         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
         (backup_row_id, schedule_id, ecs_id,
-         image_id, image_name, volume_id, 'data', 'ims_image',
+         backup_id, backup_name, volume_id, 'disk', 'vbs_backup',
          size_gb or 0, device or '', volume_type or '', now_str)
     )
 
+def _vbs_backup_disk(vol, backup_row_id, schedule_id, ecs_id, ts, description):
+    """Full VBS backup pipeline for one disk: snapshot → VBS backup → delete snapshot → register in DB.
+    Snapshot and VBS backup run sequentially within each disk's thread, but all disks run in parallel.
+    As soon as a disk's snapshot is available, VBS backup fires immediately (no waiting for other disks).
+    """
+    vol_safe = ''.join(c if c.isalnum() or c == '-' else '-' for c in vol.get('name', 'vol'))[:20]
+    snap_name = 'snap-%s-%s' % (vol_safe, ts)
+    bkp_name = 'vbs-%s-%s' % (vol_safe, ts)
+
+    log.info('VBS backup: creating snapshot for volume %s (%s GB) device=%s',
+             vol['id'][:8], vol.get('size'), vol.get('device', ''))
+    snap_id = _evs_create_snapshot(vol['id'], snap_name, description)
+    log.info('Snapshot %s available for volume %s, firing VBS backup', snap_id[:8], vol['id'][:8])
+
+    backup_id = _vbs_create_backup(vol['id'], snap_id, bkp_name, description)
+    log.info('VBS backup %s available for volume %s', backup_id[:8], vol['id'][:8])
+
+    # Delete snapshot now that VBS backup is complete
+    try:
+        _evs_delete_snapshot(snap_id)
+        log.info('Snapshot %s deleted', snap_id[:8])
+    except Exception as e:
+        log.warning('Failed to delete snapshot %s: %s', snap_id[:8], e)
+
+    conn = get_db()
+    _register_disk_backup(conn, backup_row_id, schedule_id, ecs_id,
+                          backup_id, bkp_name, vol['id'], vol.get('size'),
+                          vol.get('device', ''), vol.get('type', ''))
+    conn.commit()
+    conn.close()
+    log.info('VBS backup registered: %s device=%s', backup_id[:8], vol.get('device', ''))
+    return bkp_name
+
+# ── Delete Logic ──────────────────────────────────────────────────────────────
+
 def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
-    """Delete an IMS image and all its associated data disk IMS images."""
-    # Delete system disk IMS image (skip placeholder 'data-only' entries)
-    if img_id and img_id != 'data-only':
+    """Delete backup resources from cloud and mark as deleted in DB."""
+    project_id = get_project_id()
+
+    # Legacy IMS system disk image (not a VBS placeholder)
+    if img_id and not img_id.startswith('vbs-') and img_id != 'data-only':
         try:
             r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, img_id))
             if r.status_code in (200, 204, 404):
                 log.info('Deleted IMS image %s (%s) [HTTP %s]', img_id, img_name, r.status_code)
-                conn = get_db()
-                conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
-                conn.commit()
-                conn.close()
             else:
                 log.warning('Delete IMS image %s: HTTP %s %s', img_id, r.status_code, r.text[:150])
         except Exception as e:
             log.error('Delete IMS image %s error: %s', img_id, e)
 
-    # Delete associated data disk IMS images
+    # Mark backup_images row deleted
+    conn = get_db()
+    conn.execute('UPDATE backup_images SET deleted=1 WHERE id=?', (backup_image_row_id,))
+    conn.commit()
+    conn.close()
+
+    # Delete associated disk backup entries
     conn = get_db()
     items = conn.execute(
         'SELECT snapshot_id, snapshot_name, backup_type FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
         (backup_image_row_id,)
     ).fetchall()
     conn.close()
+
     for item in items:
         try:
-            # All new items are ims_image; legacy evs_snapshot items use EVS DELETE
-            if item['backup_type'] == 'evs_snapshot':
-                project_id = get_project_id()
+            btype = item['backup_type']
+            if btype == 'vbs_backup':
+                r = hwc_request('DELETE', '%s/v2/%s/backups/%s' % (VBS_ENDPOINT, project_id, item['snapshot_id']))
+            elif btype == 'evs_snapshot':
                 r = hwc_request('DELETE', '%s/v2/%s/snapshots/%s' % (EVS_ENDPOINT, project_id, item['snapshot_id']))
             else:
+                # Legacy IMS data image
                 r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, item['snapshot_id']))
+
             if r.status_code in (200, 202, 204, 404):
-                log.info('Deleted data item %s (%s) [HTTP %s]', item['snapshot_id'], item['snapshot_name'], r.status_code)
+                log.info('Deleted %s item %s (%s) [HTTP %s]',
+                         btype, item['snapshot_id'], item['snapshot_name'], r.status_code)
                 conn = get_db()
                 conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (item['snapshot_id'],))
                 conn.commit()
                 conn.close()
             else:
-                log.warning('Delete data item %s: HTTP %s %s', item['snapshot_id'], r.status_code, r.text[:150])
+                log.warning('Delete %s item %s: HTTP %s %s',
+                            btype, item['snapshot_id'], r.status_code, r.text[:150])
         except Exception as e:
-            log.error('Delete data item %s error: %s', item['snapshot_id'], e)
+            log.error('Delete item %s error: %s', item['snapshot_id'], e)
 
 def apply_retention(schedule_id, ecs_id, retention_count):
-    """Delete oldest backup images (+ snapshots) beyond retention_count for this schedule."""
+    """Delete oldest backup images beyond retention_count for this schedule."""
     conn = get_db()
     rows = conn.execute(
         'SELECT id, image_id, image_name FROM backup_images WHERE schedule_id=? AND ecs_id=? AND deleted=0 ORDER BY created_at ASC',
@@ -427,8 +514,10 @@ def apply_retention(schedule_id, ecs_id, retention_count):
     for row in rows[:excess]:
         delete_image_and_snapshots(row['image_id'], row['image_name'], row['id'])
 
+# ── Backup Logic ──────────────────────────────────────────────────────────────
+
 def run_backup(schedule_id):
-    """Execute a backup for a given schedule."""
+    """Execute a VBS backup for a given schedule. All disks backed up in parallel."""
     project_id = get_project_id()
     conn = get_db()
     sched = conn.execute('SELECT * FROM schedules WHERE id=?', (schedule_id,)).fetchone()
@@ -436,12 +525,14 @@ def run_backup(schedule_id):
 
     if not sched or not sched['enabled']:
         return
-    sched = dict(sched)  # sqlite3.Row → dict (needed for .get())
+    sched = dict(sched)
 
     now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     ts = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')
     safe_name = ''.join(c if c.isalnum() or c == '-' else '-' for c in sched['ecs_name'])[:30].strip('-')
     image_name = 'bkp-%s-%s' % (safe_name, ts)
+    # VBS backups use a timestamp-based placeholder as image_id (unique per backup run)
+    vbs_image_id = 'vbs-%s' % ts
 
     conn = get_db()
     cur = conn.execute(
@@ -453,7 +544,7 @@ def run_backup(schedule_id):
     conn.commit()
     conn.close()
 
-    log.info('Starting backup: schedule=%s ecs=%s image=%s', schedule_id, sched['ecs_name'], image_name)
+    log.info('Starting VBS backup: schedule=%s ecs=%s', schedule_id, sched['ecs_name'])
 
     try:
         # Determine which volumes to back up
@@ -469,105 +560,56 @@ def run_backup(schedule_id):
         if not target_vols:
             raise Exception('Ningún volumen seleccionado coincide con los discos actuales de la ECS')
 
-        # Identify system disk by device path (/dev/vda is always system on HWC KVM).
-        # Do NOT rely on bootable=true — HWC sets that flag on all volumes attached
-        # to an ECS that was booted from an image, including data disks.
-        system_vol = next((v for v in target_vols if v.get('device') == '/dev/vda'), None)
-        # Fallback: if no /dev/vda found, use bootable flag
-        if system_vol is None:
-            system_vol = next((v for v in target_vols if v.get('bootable') == 'true'), None)
-        data_vols  = [v for v in target_vols if v is not system_vol]
-
         # Build description
         vol_lines = []
         for v in target_vols:
-            rol = 'Sistema' if v.get('bootable') == 'true' else 'Datos'
+            rol = 'Sistema' if v.get('device') == '/dev/vda' else 'Datos'
             vol_lines.append('%s | %s | %s | %s GB | %s | %s' % (
-                v.get('device','-'), v.get('name','-'), v.get('type','-'),
-                v.get('size','?'), v.get('status','-'), rol))
+                v.get('device', '-'), v.get('name', '-'), v.get('type', '-'),
+                v.get('size', '?'), v.get('status', '-'), rol))
         description = ('Backup automatico. Programacion: %s. Discos: %s' % (
             sched['name'], ' | '.join(vol_lines) if vol_lines else '-'))[:255]
 
-        image_id    = None
-        backup_row_id = None
+        # Create header row in backup_images before launching disk threads
+        conn = get_db()
+        cur = conn.execute(
+            'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
+            (schedule_id, sched['ecs_id'], sched['ecs_name'], vbs_image_id, image_name, now_str)
+        )
+        backup_row_id = cur.lastrowid
+        conn.commit()
+        conn.close()
 
-        # ── System disk: IMS image via volume_id (correct min_disk) ─────────
-        if system_vol:
-            # Detect OS version from ECS image metadata
-            sys_os_version = 'Other Linux(64 bit)'
-            try:
-                er = hwc_request('GET', '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, sched['ecs_id']))
-                src_img_id = er.json().get('server', {}).get('image', {}).get('id', '')
-                if src_img_id:
-                    ir = hwc_request('GET', '%s/v2/cloudimages' % IMS_ENDPOINT,
-                                     params={'id': src_img_id, 'limit': '1'})
-                    imgs = ir.json().get('images', [])
-                    if imgs:
-                        sys_os_version = imgs[0].get('__os_version', sys_os_version)
-            except Exception:
-                pass
-            log.info('Creating system disk image from instance %s os=%s', sched['ecs_id'][:8], sys_os_version)
-            image_id = _create_volume_image(None, image_name, sys_os_version,
-                                            description=description, patch_data_image=False,
-                                            instance_id=sched['ecs_id'])
+        # Back up all disks in parallel — each disk independently runs snapshot → VBS backup
+        log.info('VBS: backing up %d disk(s) in parallel', len(target_vols))
+        with ThreadPoolExecutor(max_workers=len(target_vols)) as executor:
+            futures = {
+                executor.submit(_vbs_backup_disk, vol, backup_row_id,
+                                schedule_id, sched['ecs_id'], ts, description): vol
+                for vol in target_vols
+            }
+            errors = []
+            for future in as_completed(futures):
+                vol = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    errors.append('device %s: %s' % (vol.get('device', vol['id'][:8]), e))
+                    log.error('VBS backup failed for %s: %s', vol.get('device', ''), e)
+            if errors:
+                raise Exception('Fallo backup de disco(s): ' + '; '.join(errors))
 
-            finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            conn = get_db()
-            cur = conn.execute(
-                'INSERT OR IGNORE INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
-                (schedule_id, sched['ecs_id'], sched['ecs_name'], image_id, image_name, finished_str)
-            )
-            backup_row_id = cur.lastrowid
-            conn.commit()
-            conn.close()
-            log.info('System disk image registered: image_id=%s', image_id)
-
-        # ── Data disks: IMS image via POST /v2/cloudimages/action ───────────
-        if data_vols:
-            if backup_row_id is None:
-                # No system image — create a placeholder backup_images row to anchor data images
-                ph_name = image_name + '-data'
-                finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                conn = get_db()
-                cur = conn.execute(
-                    'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
-                    (schedule_id, sched['ecs_id'], sched['ecs_name'], 'data-only', ph_name, finished_str)
-                )
-                backup_row_id = cur.lastrowid
-                conn.commit()
-                conn.close()
-
-            log.info('Backing up %d data disk(s) in parallel', len(data_vols))
-            with ThreadPoolExecutor(max_workers=len(data_vols)) as executor:
-                futures = {
-                    executor.submit(_backup_single_data_disk, dv, backup_row_id,
-                                    schedule_id, sched['ecs_id'], ts, description): dv
-                    for dv in data_vols
-                }
-                errors = []
-                for future in as_completed(futures):
-                    dv = futures[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        errors.append('device %s: %s' % (dv.get('device', dv['id'][:8]), e))
-                        log.error('Data disk backup failed for %s: %s', dv.get('device', ''), e)
-                if errors:
-                    raise Exception('Fallo backup de disco(s) de datos: ' + '; '.join(errors))
-
-        # ── Finalize job history ─────────────────────────────────────────────
+        # Finalize job history
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        msg = 'Sistema: imagen IMS' if system_vol else ''
-        if data_vols:
-            msg += ('%s | ' % (' + ' if msg else '')) + 'Datos: %d imagen(es) IMS' % len(data_vols)
+        msg = 'VBS: %d disco(s) respaldado(s)' % len(target_vols)
         conn = get_db()
         conn.execute(
             'UPDATE job_history SET status=?, image_id=?, image_name=?, finished_at=?, message=? WHERE id=?',
-            ('success', image_id or 'data-only', image_name, finished_str, msg or 'Backup completado', job_id_db)
+            ('success', vbs_image_id, image_name, finished_str, msg, job_id_db)
         )
         conn.commit()
         conn.close()
-        log.info('Backup success for schedule %s', schedule_id)
+        log.info('VBS backup success for schedule %s', schedule_id)
         apply_retention(schedule_id, sched['ecs_id'], sched['retention_count'])
 
     except Exception as e:
@@ -634,7 +676,7 @@ def start_ecs_and_wait(ecs_id):
     project_id = get_project_id()
     r = hwc_request('POST', '%s/v2/%s/servers/%s/action' % (ECS_ENDPOINT, project_id, ecs_id),
                     body={'os-start': {}})
-    # 409 means the ECS is already starting/running — treat as success
+    # 409 means ECS is already starting — treat as success
     if r.status_code == 409:
         log.info('ECS %s already starting (409), waiting for ACTIVE', ecs_id[:8])
     elif r.status_code not in (200, 202, 204):
@@ -642,137 +684,23 @@ def start_ecs_and_wait(ecs_id):
     wait_ecs_state(ecs_id, 'ACTIVE', timeout=300)
     log.info('ECS %s started', ecs_id[:8])
 
-def _poll_ecs_job(job_id, timeout=1800):
-    """Poll an ECS async job (v1 jobs endpoint) until SUCCESS or FAIL."""
-    project_id = get_project_id()
-    job_url = '%s/v1/%s/jobs/%s' % (ECS_ENDPOINT, project_id, job_id)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        jr = hwc_request('GET', job_url)
-        if jr.status_code == 200:
-            j = jr.json()
-            status = j.get('status', '')
-            if status == 'SUCCESS':
-                return j
-            if status == 'FAIL':
-                raise Exception('Job %s failed: %s' % (job_id, j.get('fail_reason', '')))
-        time.sleep(15)
-    raise Exception('Job %s timed out after %ds' % (job_id, timeout))
-
-def restore_system_disk(ecs_id, image_id):
-    """Use changeos API to restore the system disk from a backup image."""
-    project_id = get_project_id()
-    body = {'os-change': {'imageid': image_id}}
-    r = hwc_request('POST', '%s/v2/%s/cloudservers/%s/changeos' % (ECS_ENDPOINT, project_id, ecs_id),
-                    body=body)
-    if r.status_code not in (200, 202):
-        raise Exception('changeos HTTP %s: %s' % (r.status_code, r.text[:300]))
-    job_id = r.json().get('job_id')
-    if not job_id:
-        raise Exception('No job_id en respuesta de changeos')
-    _poll_ecs_job(job_id, timeout=1800)
-    log.info('changeos completado para ECS %s con imagen %s', ecs_id[:8], image_id[:8])
-
-def restore_data_disk(ecs_id, image_id, device, size_gb, orig_volume_id, volume_type='SSD'):
-    """Create new EVS volume from backup image and swap the old data disk."""
-    project_id = get_project_id()
-
-    # Get ECS AZ
-    er = hwc_request('GET', '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, ecs_id))
-    if er.status_code != 200:
-        raise Exception('Get ECS info HTTP %s' % er.status_code)
-    server = er.json().get('server', {})
-    az = server.get('OS-EXT-AZ:availability_zone', '')
-
-    # Create new volume from backup image
-    ts = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')
-    dev_safe = device.replace('/', '-').strip('-')
-    vol_name = 'restore-%s-%s' % (dev_safe, ts)
-    create_body = {
-        'volume': {
-            'name': vol_name,
-            'size': size_gb or 50,
-            'imageRef': image_id,
-            'volume_type': volume_type or 'SSD',
-            'availability_zone': az,
-        }
-    }
-    cr = hwc_request('POST', '%s/v2/%s/cloudvolumes' % (EVS_ENDPOINT, project_id), body=create_body)
-    if cr.status_code not in (200, 202):
-        raise Exception('Create restore volume HTTP %s: %s' % (cr.status_code, cr.text[:300]))
-
-    # Resolve new volume ID (direct or via job)
-    new_vol_id = None
-    cj = cr.json()
-    if 'volume' in cj:
-        new_vol_id = cj['volume']['id']
-    elif 'job_id' in cj:
-        job_url = '%s/v1/%s/jobs/%s' % (EVS_ENDPOINT, project_id, cj['job_id'])
-        deadline = time.time() + 600
-        while time.time() < deadline:
-            jr = hwc_request('GET', job_url)
-            if jr.status_code == 200:
-                j = jr.json()
-                if j.get('status') == 'SUCCESS':
-                    entities = j.get('entities', {})
-                    sub = entities.get('sub_jobs', [])
-                    if sub:
-                        new_vol_id = sub[0].get('entities', {}).get('volume_id')
-                    if not new_vol_id:
-                        new_vol_id = entities.get('volume_id')
-                    break
-                if j.get('status') == 'FAIL':
-                    raise Exception('Create volume job failed: %s' % j.get('fail_reason', ''))
-            time.sleep(10)
-    if not new_vol_id:
-        raise Exception('No se pudo obtener el ID del nuevo volumen')
-
-    log.info('Nuevo volumen %s creado, esperando estado available', new_vol_id[:8])
-
-    # Wait for new volume to become available
-    new_vol_url = '%s/v2/%s/volumes/%s' % (EVS_ENDPOINT, project_id, new_vol_id)
-    deadline = time.time() + 600
-    while time.time() < deadline:
-        vr = hwc_request('GET', new_vol_url)
-        if vr.status_code == 200:
-            vs = vr.json().get('volume', {}).get('status', '')
-            if vs == 'available':
-                break
-            if vs == 'error':
-                raise Exception('Nuevo volumen en estado error')
-        time.sleep(10)
-    else:
-        raise Exception('Nuevo volumen no alcanzó estado available')
-
-    # Detach old volume if still attached
-    if orig_volume_id:
+def _run_parallel(tasks, label_fn, error_prefix):
+    """Run dict of {future: item} tasks, collect errors. Returns list of errors."""
+    errors = []
+    for future, item in tasks.items():
+        label = label_fn(item)
         try:
-            det_url = '%s/v2/%s/servers/%s/os-volume_attachments/%s' % (
-                ECS_ENDPOINT, project_id, ecs_id, orig_volume_id)
-            dr = hwc_request('DELETE', det_url)
-            if dr.status_code in (200, 202, 204):
-                old_vol_url = '%s/v2/%s/volumes/%s' % (EVS_ENDPOINT, project_id, orig_volume_id)
-                deadline = time.time() + 180
-                while time.time() < deadline:
-                    vr = hwc_request('GET', old_vol_url)
-                    if vr.status_code == 200:
-                        if vr.json().get('volume', {}).get('status') == 'available':
-                            break
-                    time.sleep(5)
-                log.info('Volumen original %s desconectado', orig_volume_id[:8])
+            future.result()
+            log.info('%s completed: %s', error_prefix, label)
         except Exception as e:
-            log.warning('Advertencia al desconectar volumen original: %s', e)
-
-    # Attach new volume at the same device path
-    att_url = '%s/v2/%s/servers/%s/os-volume_attachments' % (ECS_ENDPOINT, project_id, ecs_id)
-    att_body = {'volumeAttachment': {'volumeId': new_vol_id, 'device': device}}
-    ar = hwc_request('POST', att_url, body=att_body)
-    if ar.status_code not in (200, 202):
-        raise Exception('Attach volume HTTP %s: %s' % (ar.status_code, ar.text[:300]))
-    log.info('Disco de datos restaurado: volumen %s en %s', new_vol_id[:8], device)
+            errors.append('%s: %s' % (label, e))
+            log.error('%s failed for %s: %s', error_prefix, label, e)
+    return errors
 
 def run_restore(backup_image_id):
-    """Execute full restore for a backup (system + data disks) in a background thread."""
+    """Execute full VBS restore for a backup (all disks) in a background thread.
+    Flow: Stop ECS → Detach all (parallel) → VBS restore all (parallel) → Reattach all (parallel) → Start ECS
+    """
     conn = get_db()
     bimg = conn.execute('SELECT * FROM backup_images WHERE id=?', (backup_image_id,)).fetchone()
     if not bimg:
@@ -780,11 +708,13 @@ def run_restore(backup_image_id):
         log.error('run_restore: backup_image_id=%s not found', backup_image_id)
         return
     bimg = dict(bimg)
-    data_items = conn.execute(
-        'SELECT * FROM backup_snapshots WHERE backup_image_id=? AND deleted=0 AND volume_role="data"',
+
+    # Load all disk entries for this backup (both system and data)
+    disk_items = conn.execute(
+        'SELECT * FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
         (backup_image_id,)
     ).fetchall()
-    data_items = [dict(r) for r in data_items]
+    disk_items = [dict(r) for r in disk_items]
     conn.close()
 
     now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -797,54 +727,66 @@ def run_restore(backup_image_id):
     conn.commit()
     conn.close()
 
-    has_system = bimg['image_id'] and bimg['image_id'] != 'data-only'
-    has_data = len(data_items) > 0
+    ecs_id = bimg['ecs_id']
 
     try:
-        log.info('Restore %d: deteniendo ECS %s', restore_id, bimg['ecs_id'][:8])
-        stop_ecs_and_wait(bimg['ecs_id'])
+        # Validate: all disk items need volume_id and device
+        vbs_items = [i for i in disk_items if i.get('backup_type') == 'vbs_backup']
+        if not vbs_items:
+            raise Exception('No hay backups VBS en este punto de restauración')
 
-        # Build task list: system disk + all data disks run in parallel
-        restore_tasks = {}
-        with ThreadPoolExecutor(max_workers=1 + len(data_items)) as executor:
-            if has_system:
-                log.info('Restore %d: lanzando restauracion disco sistema', restore_id)
-                restore_tasks[executor.submit(restore_system_disk, bimg['ecs_id'], bimg['image_id'])] = 'sistema'
-            for item in data_items:
-                device = item.get('device') or ''
-                if not device:
-                    log.warning('Restore %d: disco de datos %s sin info de device, omitiendo',
-                                restore_id, item['snapshot_id'][:8])
-                    continue
-                log.info('Restore %d: lanzando restauracion disco datos en %s', restore_id, device)
-                f = executor.submit(restore_data_disk, bimg['ecs_id'], item['snapshot_id'],
-                                    device, item.get('size_gb'), item.get('volume_id'),
-                                    item.get('volume_type') or 'SSD')
-                restore_tasks[f] = 'datos %s' % device
+        missing_device = [i for i in vbs_items if not i.get('device')]
+        if missing_device:
+            raise Exception('Disco(s) sin información de device: %s' %
+                            ', '.join(i['snapshot_id'][:8] for i in missing_device))
 
-            errors = []
-            for future in as_completed(restore_tasks):
-                label = restore_tasks[future]
-                try:
-                    future.result()
-                    log.info('Restore %d: completado %s', restore_id, label)
-                except Exception as e:
-                    errors.append('%s: %s' % (label, e))
-                    log.error('Restore %d fallido para %s: %s', restore_id, label, e)
+        log.info('Restore %d: deteniendo ECS %s', restore_id, ecs_id[:8])
+        stop_ecs_and_wait(ecs_id)
 
+        # Detach all volumes in parallel
+        log.info('Restore %d: desconectando %d disco(s) en paralelo', restore_id, len(vbs_items))
+        with ThreadPoolExecutor(max_workers=len(vbs_items)) as executor:
+            futures = {
+                executor.submit(_detach_volume_and_wait, ecs_id, item['volume_id']): item
+                for item in vbs_items if item.get('volume_id')
+            }
+            errors = _run_parallel(futures,
+                                   lambda i: 'device %s' % i.get('device', i['volume_id'][:8]),
+                                   'Detach')
         if errors:
-            raise Exception('Fallo restauracion: ' + '; '.join(errors))
+            raise Exception('Fallo desconexión de discos: ' + '; '.join(errors))
+
+        # VBS restore all volumes in parallel
+        log.info('Restore %d: restaurando %d disco(s) en paralelo', restore_id, len(vbs_items))
+        with ThreadPoolExecutor(max_workers=len(vbs_items)) as executor:
+            futures = {
+                executor.submit(_vbs_restore_disk, item['snapshot_id'], item['volume_id']): item
+                for item in vbs_items
+            }
+            errors = _run_parallel(futures,
+                                   lambda i: 'device %s' % i.get('device', i['volume_id'][:8]),
+                                   'VBS restore')
+        if errors:
+            raise Exception('Fallo restauración VBS: ' + '; '.join(errors))
+
+        # Reattach all volumes in parallel
+        log.info('Restore %d: reconectando %d disco(s) en paralelo', restore_id, len(vbs_items))
+        with ThreadPoolExecutor(max_workers=len(vbs_items)) as executor:
+            futures = {
+                executor.submit(_attach_volume_and_wait, ecs_id, item['volume_id'], item['device']): item
+                for item in vbs_items if item.get('device')
+            }
+            errors = _run_parallel(futures,
+                                   lambda i: 'device %s' % i.get('device', i['volume_id'][:8]),
+                                   'Attach')
+        if errors:
+            raise Exception('Fallo reconexión de discos: ' + '; '.join(errors))
 
         log.info('Restore %d: iniciando ECS', restore_id)
-        start_ecs_and_wait(bimg['ecs_id'])
+        start_ecs_and_wait(ecs_id)
 
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        parts = []
-        if has_system:
-            parts.append('disco sistema restaurado')
-        if has_data:
-            parts.append('%d disco(s) de datos restaurado(s)' % len(data_items))
-        msg = ', '.join(parts) or 'Restauracion completada'
+        msg = '%d disco(s) restaurado(s) desde VBS' % len(vbs_items)
         conn = get_db()
         conn.execute(
             'UPDATE restore_history SET status=?, message=?, finished_at=? WHERE id=?',
@@ -926,16 +868,13 @@ def api_list_ecs():
         servers = r.json().get('servers', [])
         result = []
         for s in servers:
-            # Extract IPs (fixed + floating)
             ips = []
             for _net, addrs in s.get('addresses', {}).items():
                 for addr in addrs:
                     ips.append({'ip': addr.get('addr', ''), 'type': addr.get('OS-EXT-IPS:type', '')})
 
-            # Volume IDs
             vols = [v['id'] for v in s.get('os-extended-volumes:volumes_attached', [])]
 
-            # Flavor ID from link URL
             flavor_id = ''
             flavor_links = s.get('flavor', {}).get('links', [])
             if flavor_links:
@@ -963,7 +902,6 @@ def api_list_ecs():
 def api_ecs_volumes(ecs_id):
     project_id = get_project_id()
     try:
-        # Get server to find volume IDs
         url = '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, ecs_id)
         r = hwc_request('GET', url)
         if r.status_code != 200:
@@ -980,11 +918,8 @@ def api_ecs_volumes(ecs_id):
             vr = hwc_request('GET', vol_url)
             if vr.status_code == 200:
                 v = vr.json().get('volume', {})
-                # Determine if system disk from bootable flag or attachments
-                attachs = v.get('attachments', [])
-                boot_index = None
                 device = ''
-                for att in attachs:
+                for att in v.get('attachments', []):
                     if att.get('server_id') == ecs_id:
                         device = att.get('device', '')
                         break
@@ -1001,7 +936,6 @@ def api_ecs_volumes(ecs_id):
             else:
                 volumes.append({'id': vol_id, 'name': vol_id[:8], 'size': None, 'device': '', 'bootable': 'unknown'})
 
-        # Sort: system disk first
         volumes.sort(key=lambda v: (v.get('bootable') != 'true', v.get('device', '')))
         return jsonify({'volumes': volumes})
     except Exception as e:
@@ -1123,24 +1057,38 @@ def api_images():
     q += ' ORDER BY created_at DESC'
     rows = conn.execute(q, params).fetchall()
     conn.close()
-    return jsonify({'images': [dict(r) for r in rows]})
 
-@app.route('/api/images/<image_id>', methods=['DELETE'])
-def api_delete_image(image_id):
+    # Enrich each backup with its disk count
+    result = []
+    conn = get_db()
+    for row in rows:
+        d = dict(row)
+        count = conn.execute(
+            'SELECT COUNT(*) FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+            (d['id'],)
+        ).fetchone()[0]
+        d['disk_count'] = count
+        result.append(d)
+    conn.close()
+    return jsonify({'images': result})
+
+@app.route('/api/images/<int:backup_id>', methods=['DELETE'])
+def api_delete_image(backup_id):
+    """Delete a backup by row ID (works for both VBS and legacy IMS backups)."""
     try:
         conn = get_db()
-        row = conn.execute('SELECT id, image_name FROM backup_images WHERE image_id=?', (image_id,)).fetchone()
+        row = conn.execute('SELECT * FROM backup_images WHERE id=?', (backup_id,)).fetchone()
         conn.close()
-        row_id = row['id'] if row else 0
-        img_name = row['image_name'] if row else ''
-        delete_image_and_snapshots(image_id, img_name, row_id)
+        if not row:
+            return jsonify({'error': 'Backup no encontrado'}), 404
+        delete_image_and_snapshots(row['image_id'], row['image_name'], row['id'])
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/restore/<int:backup_image_id>', methods=['POST'])
 def api_restore(backup_image_id):
-    """Start a restore job for a backup image (system + data disks)."""
+    """Start a VBS restore job for a backup."""
     conn = get_db()
     bimg = conn.execute('SELECT id FROM backup_images WHERE id=?', (backup_image_id,)).fetchone()
     conn.close()
@@ -1148,7 +1096,7 @@ def api_restore(backup_image_id):
         return jsonify({'error': 'Backup no encontrado'}), 404
     thread = threading.Thread(target=run_restore, args=(backup_image_id,), daemon=True)
     thread.start()
-    return jsonify({'ok': True, 'message': 'Restauracion iniciada'})
+    return jsonify({'ok': True, 'message': 'Restauracion VBS iniciada'})
 
 @app.route('/api/restore_history')
 def api_restore_history():
