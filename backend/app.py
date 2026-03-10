@@ -1558,6 +1558,15 @@ def api_snapshots():
 
 def startup():
     init_db()
+    # Mark any jobs that were left 'running' (interrupted by a previous restart) as failed
+    conn = get_db()
+    cur = conn.execute(
+        "UPDATE job_history SET status='failed', message='Interrumpido por reinicio del servicio', "
+        "finished_at=started_at WHERE status='running'"
+    )
+    if cur.rowcount:
+        log.warning('Marked %d interrupted job(s) as failed on startup', cur.rowcount)
+    conn.commit(); conn.close()
     reload_schedules()
     scheduler.start()
     pid = get_project_id()
