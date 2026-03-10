@@ -125,40 +125,32 @@
   .card-body { padding: 20px; }
 
   /* ── Grid ── */
-  .ecs-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 12px;
+  .ecs-table { width: 100%; border-collapse: collapse; }
+  .ecs-table th {
+    text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--text-muted);
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
   }
-
-  .ecs-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 16px;
-    cursor: pointer;
-    transition: border-color .15s, box-shadow .15s;
-    position: relative;
-  }
-  .ecs-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
-  .ecs-card.selected {
-    border-color: var(--accent);
-    background: var(--accent-light);
-  }
-  .ecs-card-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
-  .ecs-icon {
-    width: 32px; height: 32px;
-    border-radius: 6px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0;
-  }
-  .ecs-icon svg { width: 16px; height: 16px; }
-  .ecs-name { font-weight: 600; font-size: 13px; word-break: break-all; }
-  .ecs-flavor { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
-  .ecs-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .ecs-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
+  .ecs-table tr:last-child td { border-bottom: none; }
+  .ecs-table tr { cursor: pointer; transition: background .1s; }
+  .ecs-table tr:hover td { background: var(--bg); }
+  .ecs-table tr.selected td { background: var(--accent-light); }
+  .ecs-name { font-weight: 600; }
   .ecs-ip { font-size: 11px; color: var(--text-muted); font-family: monospace; }
+
+  .quota-bar-wrap {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; margin-bottom: 4px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); font-size: 12px;
+  }
+  .quota-bar-track {
+    flex: 1; height: 6px; background: var(--border); border-radius: 999px; overflow: hidden;
+  }
+  .quota-bar-fill { height: 100%; border-radius: 999px; transition: width .4s; background: var(--accent); }
+  .quota-bar-fill.warn { background: var(--warning); }
+  .quota-bar-fill.danger { background: var(--error); }
 
   /* ── Status badge ── */
   .badge {
@@ -484,8 +476,11 @@
         Actualizar
       </button>
     </div>
-    <div id="ecs-grid" class="ecs-grid">
-      <div class="loading-row" style="grid-column: 1/-1"><div class="spinner"></div></div>
+    <div id="ims-quota-bar"></div>
+    <div class="card" style="margin-bottom:12px">
+      <div id="ecs-grid">
+        <div class="loading-row"><div class="spinner"></div></div>
+      </div>
     </div>
 
     <!-- Detail panel -->
@@ -684,45 +679,67 @@ function statusBadge(s) {
 
 async function loadECS() {
   const grid = document.getElementById('ecs-grid');
-  grid.innerHTML = '<div class="loading-row" style="grid-column:1/-1"><div class="spinner"></div></div>';
+  grid.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
   try {
-    const r = await fetch(`${API}/api/ecs`);
-    const d = await r.json();
+    const [er, qr] = await Promise.all([
+      fetch(`${API}/api/ecs`),
+      fetch(`${API}/api/ims_quota`),
+    ]);
+    const d = await er.json();
+    const q = await qr.json();
+
+    // Render quota bar
+    const qEl = document.getElementById('ims-quota-bar');
+    if (q.quota !== undefined) {
+      const pct = Math.round(q.used / q.quota * 100);
+      const fillCls = pct >= 90 ? 'danger' : pct >= 70 ? 'warn' : '';
+      qEl.innerHTML = `
+        <div class="quota-bar-wrap">
+          <span style="color:var(--text-muted)">Cuota IMS</span>
+          <div class="quota-bar-track"><div class="quota-bar-fill ${fillCls}" style="width:${pct}%"></div></div>
+          <span style="font-weight:600">${q.used} / ${q.quota}</span>
+          <span style="color:var(--text-muted)">&middot; <strong style="color:${fillCls==='danger'?'var(--error)':fillCls==='warn'?'var(--warning)':'var(--success)'}">${q.available}</strong> disponibles</span>
+        </div>`;
+    } else { qEl.innerHTML = ''; }
+
     if (!d.servers || d.servers.length === 0) {
-      grid.innerHTML = '<div class="empty" style="grid-column:1/-1"><div class="empty-icon">&#9729;</div><p>No se encontraron instancias ECS</p></div>';
+      grid.innerHTML = '<div class="empty"><div class="empty-icon">&#9729;</div><p>No se encontraron instancias ECS</p></div>';
       return;
     }
-    grid.innerHTML = d.servers.map(s => `
-      <div class="ecs-card" id="ecs-${s.id}" onclick="selectECS(${JSON.stringify(s).replace(/"/g,'&quot;')})">
-        <div class="ecs-card-header">
-          <div class="ecs-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-              <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/>
-            </svg>
-          </div>
-          <div style="flex:1;min-width:0">
-            <div class="ecs-name truncate">${esc(s.name)}</div>
-            <div class="ecs-flavor">${esc(s.flavor || '')} &middot; ${s.volume_ids ? s.volume_ids.length : 0} disco(s)</div>
-          </div>
-          ${statusBadge(s.status)}
-        </div>
-        <div class="ecs-meta">
-          ${s.ips.map(ip => `<span class="ecs-ip">${esc(ip.ip)}</span>`).join('')}
-          ${s.az ? `<span class="text-sm text-muted">${esc(s.az)}</span>` : ''}
-        </div>
-        ${s.image_name ? `<div class="text-sm text-muted mt-1 truncate">${esc(s.image_name)}</div>` : ''}
-      </div>
-    `).join('');
+    grid.innerHTML = `
+      <table class="ecs-table">
+        <thead><tr>
+          <th>Nombre</th>
+          <th>Estado</th>
+          <th>IPs</th>
+          <th>Flavor</th>
+          <th>Discos</th>
+          <th>Imagen base</th>
+          <th>AZ</th>
+        </tr></thead>
+        <tbody>
+          ${d.servers.map(s => `
+            <tr id="ecs-${s.id}" onclick="selectECS(${JSON.stringify(s).replace(/"/g,'&quot;')})">
+              <td class="ecs-name">${esc(s.name)}</td>
+              <td>${statusBadge(s.status)}</td>
+              <td>${s.ips.map(ip => `<span class="ecs-ip">${esc(ip.ip)}</span>`).join('<br>')}</td>
+              <td class="text-muted" style="font-size:12px">${esc(s.flavor || '—')}</td>
+              <td style="text-align:center">${s.volume_ids ? s.volume_ids.length : '—'}</td>
+              <td class="text-muted truncate" style="max-width:180px;font-size:12px">${esc(s.image_name || '—')}</td>
+              <td class="text-muted" style="font-size:12px">${esc(s.az || '—')}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
   } catch(e) {
-    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><p>Error cargando ECS: ${esc(e.message)}</p></div>`;
+    document.getElementById('ecs-grid').innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
   }
 }
 
 async function selectECS(server) {
   selectedECS = server;
-  document.querySelectorAll('.ecs-card').forEach(c => c.classList.remove('selected'));
-  const card = document.getElementById(`ecs-${server.id}`);
-  if (card) { card.classList.add('selected'); card.scrollIntoView({behavior:'smooth', block:'nearest'}); }
+  document.querySelectorAll('.ecs-table tr').forEach(r => r.classList.remove('selected'));
+  const row = document.getElementById(`ecs-${server.id}`);
+  if (row) { row.classList.add('selected'); row.scrollIntoView({behavior:'smooth', block:'nearest'}); }
 
   const panel = document.getElementById('detail-panel');
   panel.classList.add('visible');
