@@ -1,41 +1,43 @@
-{
-  "Version": "1.1",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ecs:servers:list",
-        "ecs:servers:get",
-        "ecs:servers:stop",
-        "ecs:servers:start",
-        "ecs:serverVolumeAttachments:create",
-        "ecs:serverVolumeAttachments:delete",
-        "ecs:servers:changeOS",
-        "ecs:jobs:get"
-      ],
-      "Resource": ["*"]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "evs:volumes:get",
-        "evs:volumes:list",
-        "evs:volumes:create",
-        "evs:jobs:get"
-      ],
-      "Resource": ["*"]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ims:images:list",
-        "ims:images:get",
-        "ims:images:create",
-        "ims:images:update",
-        "ims:images:delete",
-        "ims:jobs:get"
-      ],
-      "Resource": ["*"]
-    }
-  ]
-}
+# Permisos IAM requeridos por bkp2ims
+
+## Políticas de sistema recomendadas
+
+Asignar las siguientes políticas predefinidas de Huawei Cloud a la agencia IAM de la ECS:
+
+| Política         | Servicio | Cobertura                                              |
+|------------------|----------|--------------------------------------------------------|
+| ECS FullAccess   | ECS      | Listar/consultar ECS, start/stop, changeOS, attach/detach volúmenes, jobs |
+| EVS FullAccess   | EVS      | Consultar, crear y gestionar volúmenes y jobs          |
+| IMS FullAccess   | IMS      | Crear, actualizar, eliminar imágenes y consultar jobs  |
+
+Estas tres políticas reemplazan a **Tenant Administrator** y **OBS Administrator**,
+que son excesivamente amplias para el uso de esta aplicación.
+
+## Por qué no una custom policy
+
+Las custom policies requieren strings de acción exactos que varían entre versiones de API
+(v1/v2/OpenStack) y no siempre están documentados públicamente. Las políticas de sistema
+son la opción más robusta y mantenible.
+
+## Operaciones que realiza la app
+
+### ECS
+- GET  /v2/{project}/servers/detail             — listar ECS disponibles
+- GET  /v2/{project}/servers/{id}               — obtener detalles (AZ, imagen, discos)
+- POST /v2/{project}/servers/{id}/action        — os-stop / os-start
+- POST /v2/{project}/cloudservers/{id}/changeos — restaurar disco de sistema
+- POST /v2/{project}/servers/{id}/os-volume_attachments       — conectar disco
+- DELETE /v2/{project}/servers/{id}/os-volume_attachments/{v} — desconectar disco
+- GET  /v1/{project}/jobs/{job_id}              — polling de jobs async
+
+### EVS
+- GET  /v2/{project}/volumes/{id}               — consultar estado de disco
+- POST /v2/{project}/cloudvolumes               — crear volumen nuevo (restore de datos)
+- GET  /v1/{project}/jobs/{job_id}              — polling de jobs async
+
+### IMS
+- GET  /v2/cloudimages                          — consultar OS version de imagen origen
+- POST /v2/cloudimages/action                   — crear imagen de backup
+- PATCH /v2/images/{id}                         — marcar imagen como DataImage
+- DELETE /v2/images/{id}                        — eliminar backup (retención)
+- GET  /v1/{project}/jobs/{job_id}              — polling de jobs async
