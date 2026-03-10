@@ -2,6 +2,7 @@ import os
 import json
 import hmac
 import hashlib
+import base64
 import datetime
 import threading
 import sqlite3
@@ -179,6 +180,13 @@ def init_db():
         'ALTER TABLE backup_snapshots ADD COLUMN backup_type TEXT DEFAULT "ims_image"',
         'ALTER TABLE backup_snapshots ADD COLUMN device TEXT',
         'ALTER TABLE backup_snapshots ADD COLUMN volume_type TEXT',
+        'ALTER TABLE backup_images ADD COLUMN obs_url TEXT',
+        'ALTER TABLE backup_images ADD COLUMN obs_status TEXT',
+        'ALTER TABLE backup_images ADD COLUMN ims_deleted INTEGER DEFAULT 0',
+        'ALTER TABLE backup_images ADD COLUMN os_type TEXT',
+        'ALTER TABLE backup_snapshots ADD COLUMN obs_url TEXT',
+        'ALTER TABLE backup_snapshots ADD COLUMN obs_status TEXT',
+        'ALTER TABLE backup_snapshots ADD COLUMN ims_deleted INTEGER DEFAULT 0',
     ]:
         try:
             conn.execute(migration)
@@ -385,18 +393,30 @@ def _register_data_image(conn, backup_row_id, schedule_id, ecs_id, image_id, ima
          size_gb or 0, device or '', volume_type or '', now_str)
     )
 
-def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
-    """Delete an IMS image and all its associated data disk IMS images."""
+def delete_image_and_snapshots(img_id, img_name, backup_image_row_id, keep_obs=False):
+    """Delete an IMS image and all its associated data disk IMS images.
+    If keep_obs=True and obs_url is set: mark ims_deleted=1 (row kept for OBS restore)
+    instead of deleted=1. Pass keep_obs=True for user-initiated deletes; False for retention.
+    """
+    conn = get_db()
+    bimg_row = conn.execute(
+        'SELECT obs_url FROM backup_images WHERE id=?', (backup_image_row_id,)
+    ).fetchone()
+    has_obs = bimg_row and bimg_row['obs_url']
+    conn.close()
+
     # Delete system disk IMS image (skip placeholder 'data-only' entries)
-    if img_id and img_id != 'data-only':
+    if img_id and img_id not in ('data-only', 'pending'):
         try:
             r = hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, img_id))
             if r.status_code in (200, 204, 404):
                 log.info('Deleted IMS image %s (%s) [HTTP %s]', img_id, img_name, r.status_code)
                 conn = get_db()
-                conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
-                conn.commit()
-                conn.close()
+                if keep_obs and has_obs:
+                    conn.execute('UPDATE backup_images SET ims_deleted=1 WHERE image_id=?', (img_id,))
+                else:
+                    conn.execute('UPDATE backup_images SET deleted=1 WHERE image_id=?', (img_id,))
+                conn.commit(); conn.close()
             else:
                 log.warning('Delete IMS image %s: HTTP %s %s', img_id, r.status_code, r.text[:150])
         except Exception as e:
@@ -405,11 +425,12 @@ def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
     # Delete associated data disk IMS images
     conn = get_db()
     items = conn.execute(
-        'SELECT snapshot_id, snapshot_name, backup_type FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+        'SELECT snapshot_id, snapshot_name, backup_type, obs_url FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
         (backup_image_row_id,)
     ).fetchall()
     conn.close()
     for item in items:
+        item_has_obs = item['obs_url']
         try:
             # All new items are ims_image; legacy evs_snapshot items use EVS DELETE
             if item['backup_type'] == 'evs_snapshot':
@@ -420,13 +441,250 @@ def delete_image_and_snapshots(img_id, img_name, backup_image_row_id):
             if r.status_code in (200, 202, 204, 404):
                 log.info('Deleted data item %s (%s) [HTTP %s]', item['snapshot_id'], item['snapshot_name'], r.status_code)
                 conn = get_db()
-                conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (item['snapshot_id'],))
-                conn.commit()
-                conn.close()
+                if keep_obs and item_has_obs:
+                    conn.execute('UPDATE backup_snapshots SET ims_deleted=1 WHERE snapshot_id=?', (item['snapshot_id'],))
+                else:
+                    conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (item['snapshot_id'],))
+                conn.commit(); conn.close()
             else:
                 log.warning('Delete data item %s: HTTP %s %s', item['snapshot_id'], r.status_code, r.text[:150])
         except Exception as e:
             log.error('Delete data item %s error: %s', item['snapshot_id'], e)
+
+# ── OBS Export / Import ───────────────────────────────────────────────────────
+
+def get_obs_bucket():
+    """Return the OBS bucket name for this installation: bkp2ims-{project_id}."""
+    return 'bkp2ims-%s' % get_project_id()
+
+def _obs_request(method, resource, body=b'', content_type='application/xml'):
+    """Sign and execute an OBS V1 REST request (path-style URL).
+    resource: canonical resource, e.g. '/bkp2ims-xxx/' or '/bkp2ims-xxx/file.zvhd2'
+    """
+    creds = get_credentials()
+    ak, sk, token = creds['ak'], creds['sk'], creds.get('token', '')
+    date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+    if isinstance(body, str):
+        body = body.encode('utf-8')
+
+    content_md5 = ''
+    if body:
+        content_md5 = base64.b64encode(hashlib.md5(body).digest()).decode()
+
+    obs_headers = {}
+    if token:
+        obs_headers['x-obs-security-token'] = token
+
+    # CanonicalizedOBSHeaders: sorted x-obs-* headers
+    canon_hdrs = ''.join('%s:%s\n' % (k, obs_headers[k]) for k in sorted(obs_headers))
+    string_to_sign = '\n'.join([method, content_md5, content_type, date]) + '\n' + canon_hdrs + resource
+    sig = base64.b64encode(
+        hmac.new(sk.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1).digest()
+    ).decode()
+
+    headers = {
+        'Date': date,
+        'Content-Type': content_type,
+        'Authorization': 'OBS %s:%s' % (ak, sig),
+    }
+    if content_md5:
+        headers['Content-MD5'] = content_md5
+    for k, v in obs_headers.items():
+        headers[k] = v
+
+    url = 'https://obs.%s.myhuaweicloud.com%s' % (REGION, resource)
+    return requests.request(method, url, headers=headers, data=body or None, timeout=30)
+
+def _ensure_obs_bucket():
+    """Create the OBS bucket bkp2ims-{project_id} if it does not exist."""
+    bucket = get_obs_bucket()
+    resource = '/%s/' % bucket
+    r = _obs_request('HEAD', resource)
+    if r.status_code == 200:
+        log.info('OBS bucket already exists: %s', bucket)
+        return True
+    if r.status_code in (403, 401):
+        log.warning('OBS bucket check: no permissions (HTTP %s) — export will require OBS OperateAccess on agency', r.status_code)
+        return False
+    if r.status_code == 404:
+        xml_body = ('<CreateBucketConfiguration>'
+                    '<Location>%s</Location>'
+                    '</CreateBucketConfiguration>') % REGION
+        cr = _obs_request('PUT', resource, body=xml_body, content_type='application/xml')
+        if cr.status_code in (200, 201):
+            log.info('OBS bucket created: %s', bucket)
+            return True
+        log.warning('OBS bucket create HTTP %s: %s', cr.status_code, cr.text[:200])
+        return False
+    log.warning('OBS bucket HEAD unexpected HTTP %s', r.status_code)
+    return False
+
+def _export_image_to_obs(image_id, obs_filename):
+    """Export one IMS image to OBS. Returns the obs:// URL. Blocks until job completes."""
+    bucket = get_obs_bucket()
+    obs_url = 'obs://%s/%s' % (bucket, obs_filename)
+    project_id = get_project_id()
+    body = {'bucket_url': obs_url, 'file_type': 'zvhd2'}
+    r = hwc_request('POST', '%s/v1/cloudimages/%s/file' % (IMS_ENDPOINT, image_id), body=body)
+    if r.status_code not in (200, 202):
+        raise Exception('IMS export HTTP %s: %s' % (r.status_code, r.text[:300]))
+    resp_data = r.json()
+    job_id = resp_data.get('job_id') or (resp_data.get('body') or {}).get('job_id')
+    if not job_id:
+        raise Exception('No job_id en respuesta de export IMS: %s' % r.text[:200])
+    log.info('IMS export started: image=%s job=%s dest=%s', image_id[:8], job_id, obs_url)
+
+    job_url = '%s/v1/%s/jobs/%s' % (IMS_ENDPOINT, project_id, job_id)
+    deadline = time.time() + 7200  # large images can take up to 2 hours
+    while time.time() < deadline:
+        jr = hwc_request('GET', job_url)
+        if jr.status_code == 200:
+            j = jr.json()
+            status = j.get('status', '')
+            if status == 'SUCCESS':
+                log.info('IMS export complete: %s → %s', image_id[:8], obs_url)
+                return obs_url
+            if status == 'FAIL':
+                raise Exception('IMS export job failed: %s' % j.get('fail_reason', ''))
+        time.sleep(30)
+    raise Exception('IMS export timed out (job_id=%s)' % job_id)
+
+def _export_backup_to_obs(backup_image_id):
+    """Background task: export all IMS images for a backup to OBS.
+    Updates obs_url / obs_status in DB as work progresses.
+    """
+    conn = get_db()
+    bimg = conn.execute('SELECT * FROM backup_images WHERE id=?', (backup_image_id,)).fetchone()
+    if not bimg:
+        conn.close()
+        return
+    bimg = dict(bimg)
+    data_items = conn.execute(
+        'SELECT * FROM backup_snapshots WHERE backup_image_id=? AND deleted=0 AND ims_deleted=0',
+        (backup_image_id,)
+    ).fetchall()
+    data_items = [dict(r) for r in data_items]
+    conn.close()
+
+    if not _ensure_obs_bucket():
+        conn = get_db()
+        conn.execute('UPDATE backup_images SET obs_status=? WHERE id=?', ('failed', backup_image_id))
+        conn.commit(); conn.close()
+        log.error('Export backup %d: cannot access OBS bucket', backup_image_id)
+        return
+
+    errors = []
+
+    # Export system disk image
+    sys_img_id = bimg.get('image_id', '')
+    if sys_img_id and sys_img_id not in ('pending', 'data-only') and not bimg.get('obs_url'):
+        try:
+            obs_file = '%s.zvhd2' % bimg['image_name']
+            obs_url = _export_image_to_obs(sys_img_id, obs_file)
+            conn = get_db()
+            conn.execute(
+                'UPDATE backup_images SET obs_url=?, obs_status=? WHERE id=?',
+                (obs_url, 'exported', backup_image_id)
+            )
+            conn.commit(); conn.close()
+            log.info('System image exported to OBS: %s', obs_url)
+        except Exception as e:
+            errors.append('sistema: %s' % e)
+            log.error('Export system image %s: %s', sys_img_id[:8], e)
+    elif bimg.get('obs_url'):
+        log.info('System image already exported: %s', bimg['obs_url'])
+
+    # Export data disk images in parallel
+    def _export_data_item(item):
+        if item.get('obs_url'):
+            return
+        obs_file = '%s.zvhd2' % item['snapshot_name']
+        obs_url = _export_image_to_obs(item['snapshot_id'], obs_file)
+        conn = get_db()
+        conn.execute(
+            'UPDATE backup_snapshots SET obs_url=?, obs_status=? WHERE id=?',
+            (obs_url, 'exported', item['id'])
+        )
+        conn.commit(); conn.close()
+        log.info('Data image exported to OBS: %s', obs_url)
+
+    if data_items:
+        with ThreadPoolExecutor(max_workers=len(data_items)) as executor:
+            futures = {executor.submit(_export_data_item, item): item for item in data_items}
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    errors.append('datos %s: %s' % (item.get('device', item['snapshot_id'][:8]), e))
+                    log.error('Export data image %s: %s', item['snapshot_id'][:8], e)
+
+    # Set final status on backup_images if system was exported
+    if sys_img_id and sys_img_id not in ('pending', 'data-only'):
+        final_status = 'failed' if errors else 'exported'
+        conn = get_db()
+        conn.execute(
+            "UPDATE backup_images SET obs_status=? WHERE id=? AND obs_status='exporting'",
+            (final_status, backup_image_id)
+        )
+        conn.commit(); conn.close()
+
+    if errors:
+        log.error('Export backup %d finished with errors: %s', backup_image_id, '; '.join(errors))
+    else:
+        log.info('Export backup %d finished OK', backup_image_id)
+
+def _delete_obs_file(obs_url):
+    """Delete a file from OBS. obs_url format: obs://bucket/filename.zvhd2"""
+    if not obs_url or not obs_url.startswith('obs://'):
+        return
+    parts = obs_url[6:].split('/', 1)
+    bucket = parts[0]
+    key = parts[1] if len(parts) > 1 else ''
+    resource = '/%s/%s' % (bucket, key)
+    r = _obs_request('DELETE', resource)
+    if r.status_code in (200, 204):
+        log.info('Deleted OBS file: %s', obs_url)
+    else:
+        log.warning('Delete OBS file %s: HTTP %s', obs_url, r.status_code)
+
+def _import_from_obs(obs_url, name, is_system, os_type='Linux'):
+    """Import an IMS image from OBS. Returns new image_id. Blocks until complete."""
+    body = {
+        'name': name,
+        'image_url': obs_url,
+        'is_quick_import': True,
+    }
+    if is_system:
+        body['os_type'] = os_type
+    else:
+        body['type'] = 'DataImage'
+    r = hwc_request('POST', '%s/v2/cloudimages/action' % IMS_ENDPOINT, body=body)
+    if r.status_code not in (200, 202):
+        raise Exception('IMS import desde OBS HTTP %s: %s' % (r.status_code, r.text[:300]))
+    job_id = r.json().get('job_id')
+    if not job_id:
+        raise Exception('No job_id en respuesta de import desde OBS')
+    log.info('IMS import from OBS started: job=%s src=%s', job_id, obs_url)
+
+    project_id = get_project_id()
+    job_url = '%s/v1/%s/jobs/%s' % (IMS_ENDPOINT, project_id, job_id)
+    deadline = time.time() + 3600
+    while time.time() < deadline:
+        jr = hwc_request('GET', job_url)
+        if jr.status_code == 200:
+            j = jr.json()
+            status = j.get('status', '')
+            if status == 'SUCCESS':
+                image_id = j.get('entities', {}).get('image_id')
+                if not image_id:
+                    raise Exception('No image_id en resultado de import desde OBS')
+                log.info('IMS import from OBS complete: image_id=%s', image_id[:8])
+                return image_id
+            if status == 'FAIL':
+                raise Exception('Import desde OBS fallido: %s' % j.get('fail_reason', ''))
+        time.sleep(20)
+    raise Exception('Import desde OBS timeout (job_id=%s)' % job_id)
 
 def apply_retention(schedule_id, ecs_id, retention_count):
     """Delete oldest backup images (+ snapshots) beyond retention_count for this schedule."""
@@ -523,10 +781,11 @@ def run_backup(schedule_id):
         # image_id arranca como 'pending' y el thread del sistema lo actualiza al terminar.
         # Si no hay disco de sistema, queda como 'data-only'.
         placeholder = 'pending' if system_vol else 'data-only'
+        os_type = 'Windows' if 'windows' in sys_os_version.lower() else 'Linux'
         conn = get_db()
         cur = conn.execute(
-            'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
-            (schedule_id, sched['ecs_id'], sched['ecs_name'], placeholder, image_name, now_str)
+            'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, os_type, created_at) VALUES (?,?,?,?,?,?,?)',
+            (schedule_id, sched['ecs_id'], sched['ecs_name'], placeholder, image_name, os_type, now_str)
         )
         backup_row_id = cur.lastrowid
         conn.commit()
@@ -781,7 +1040,10 @@ def restore_data_disk(ecs_id, image_id, device, size_gb, orig_volume_id, volume_
     log.info('Disco de datos restaurado: volumen %s en %s', new_vol_id[:8], device)
 
 def run_restore(backup_image_id):
-    """Execute full restore for a backup (system + data disks) in a background thread."""
+    """Execute full restore for a backup (system + data disks) in a background thread.
+    If an image was exported to OBS and deleted from IMS (ims_deleted=1), it is
+    re-imported from OBS first, then used for restore, then the temp image is deleted.
+    """
     conn = get_db()
     bimg = conn.execute('SELECT * FROM backup_images WHERE id=?', (backup_image_id,)).fetchone()
     if not bimg:
@@ -806,27 +1068,63 @@ def run_restore(backup_image_id):
     conn.commit()
     conn.close()
 
-    has_system = bimg['image_id'] and bimg['image_id'] != 'data-only'
+    has_system = bimg['image_id'] and bimg['image_id'] not in ('data-only', 'pending')
+    need_sys_obs = not has_system and bimg.get('obs_url') and bimg.get('ims_deleted')
     has_data = len(data_items) > 0
 
+    ts_r = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')
+    temp_images = []  # temp IMS images to delete after restore
+
     try:
+        # ── Phase 1: import from OBS if needed (parallel) ────────────────────
+        import_futures = {}
+        with ThreadPoolExecutor(max_workers=1 + len(data_items)) as imp_ex:
+            if need_sys_obs:
+                log.info('Restore %d: importing system image from OBS: %s', restore_id, bimg['obs_url'])
+                f = imp_ex.submit(_import_from_obs, bimg['obs_url'],
+                                  'restore-sys-%s' % ts_r, True,
+                                  bimg.get('os_type') or 'Linux')
+                import_futures[f] = 'system'
+            for item in data_items:
+                if item.get('obs_url') and item.get('ims_deleted'):
+                    log.info('Restore %d: importing data image from OBS: %s', restore_id, item['obs_url'])
+                    f = imp_ex.submit(_import_from_obs, item['obs_url'],
+                                      'restore-data-%s-%s' % (item['id'], ts_r), False)
+                    import_futures[f] = ('data', item['id'])
+
+            imported = {}  # 'system' or item_id → new_image_id
+            for future in as_completed(import_futures):
+                key = import_futures[future]
+                img_id = future.result()  # raises on error
+                k = key if isinstance(key, str) else key[1]
+                imported[k] = img_id
+                temp_images.append(img_id)
+
+        # Resolve effective image IDs
+        sys_image_id = imported.get('system') or bimg['image_id']
+        if need_sys_obs and imported.get('system'):
+            has_system = True
+        data_image_map = {item['id']: imported.get(item['id']) or item['snapshot_id']
+                          for item in data_items}
+
+        # ── Phase 2: stop ECS + restore in parallel ──────────────────────────
         log.info('Restore %d: deteniendo ECS %s', restore_id, bimg['ecs_id'][:8])
         stop_ecs_and_wait(bimg['ecs_id'])
 
-        # Build task list: system disk + all data disks run in parallel
         restore_tasks = {}
         with ThreadPoolExecutor(max_workers=1 + len(data_items)) as executor:
             if has_system:
                 log.info('Restore %d: lanzando restauracion disco sistema', restore_id)
-                restore_tasks[executor.submit(restore_system_disk, bimg['ecs_id'], bimg['image_id'])] = 'sistema'
+                restore_tasks[executor.submit(restore_system_disk, bimg['ecs_id'], sys_image_id)] = 'sistema'
             for item in data_items:
                 device = item.get('device') or ''
                 if not device:
                     log.warning('Restore %d: disco de datos %s sin info de device, omitiendo',
                                 restore_id, item['snapshot_id'][:8])
                     continue
+                eff_img = data_image_map.get(item['id']) or item['snapshot_id']
                 log.info('Restore %d: lanzando restauracion disco datos en %s', restore_id, device)
-                f = executor.submit(restore_data_disk, bimg['ecs_id'], item['snapshot_id'],
+                f = executor.submit(restore_data_disk, bimg['ecs_id'], eff_img,
                                     device, item.get('size_gb'), item.get('volume_id'),
                                     item.get('volume_type') or 'SSD')
                 restore_tasks[f] = 'datos %s' % device
@@ -846,6 +1144,14 @@ def run_restore(backup_image_id):
 
         log.info('Restore %d: iniciando ECS', restore_id)
         start_ecs_and_wait(bimg['ecs_id'])
+
+        # Cleanup temporary IMS images imported from OBS
+        for tmp_id in temp_images:
+            try:
+                hwc_request('DELETE', '%s/v2/images/%s' % (IMS_ENDPOINT, tmp_id))
+                log.info('Deleted temp OBS-import image %s', tmp_id[:8])
+            except Exception as e:
+                log.warning('Could not delete temp image %s: %s', tmp_id, e)
 
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         parts = []
@@ -1134,6 +1440,61 @@ def api_images():
     conn.close()
     return jsonify({'images': [dict(r) for r in rows]})
 
+@app.route('/api/images/<int:backup_id>/export', methods=['POST'])
+def api_export_backup(backup_id):
+    """Start OBS export for all IMS images of a backup. Returns immediately; runs in background."""
+    conn = get_db()
+    row = conn.execute('SELECT id, image_id, obs_status FROM backup_images WHERE id=?', (backup_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'error': 'Backup no encontrado'}), 404
+    if row['obs_status'] == 'exporting':
+        return jsonify({'error': 'Export ya en progreso'}), 409
+    if row['image_id'] in ('pending', 'data-only'):
+        return jsonify({'error': 'Este backup no tiene imagen de sistema disponible para exportar'}), 400
+    # Mark as exporting
+    conn = get_db()
+    conn.execute('UPDATE backup_images SET obs_status=? WHERE id=?', ('exporting', backup_id))
+    conn.commit(); conn.close()
+    thread = threading.Thread(target=_export_backup_to_obs, args=(backup_id,), daemon=True)
+    thread.start()
+    return jsonify({'ok': True, 'message': 'Export a OBS iniciado', 'bucket': get_obs_bucket()})
+
+@app.route('/api/images/<int:backup_id>/delete_obs', methods=['DELETE'])
+def api_delete_obs(backup_id):
+    """Delete OBS files for a backup. If IMS images are also deleted (ims_deleted=1),
+    marks backup as fully deleted=1."""
+    conn = get_db()
+    bimg = conn.execute('SELECT * FROM backup_images WHERE id=?', (backup_id,)).fetchone()
+    if not bimg:
+        conn.close()
+        return jsonify({'error': 'Backup no encontrado'}), 404
+    bimg = dict(bimg)
+    data_items = conn.execute(
+        'SELECT * FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+        (backup_id,)
+    ).fetchall()
+    data_items = [dict(r) for r in data_items]
+    conn.close()
+    try:
+        if bimg.get('obs_url'):
+            _delete_obs_file(bimg['obs_url'])
+        for item in data_items:
+            if item.get('obs_url'):
+                _delete_obs_file(item['obs_url'])
+        # If IMS images are already gone, mark fully deleted; else just clear OBS fields
+        conn = get_db()
+        if bimg.get('ims_deleted'):
+            conn.execute('UPDATE backup_images SET deleted=1 WHERE id=?', (backup_id,))
+            conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE backup_image_id=?', (backup_id,))
+        else:
+            conn.execute('UPDATE backup_images SET obs_url=NULL, obs_status=NULL WHERE id=?', (backup_id,))
+            conn.execute('UPDATE backup_snapshots SET obs_url=NULL, obs_status=NULL WHERE backup_image_id=?', (backup_id,))
+        conn.commit(); conn.close()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/images/<image_id>', methods=['DELETE'])
 def api_delete_image(image_id):
     try:
@@ -1142,7 +1503,8 @@ def api_delete_image(image_id):
         conn.close()
         row_id = row['id'] if row else 0
         img_name = row['image_name'] if row else ''
-        delete_image_and_snapshots(image_id, img_name, row_id)
+        # keep_obs=True: if OBS copy exists, keep row visible for restore
+        delete_image_and_snapshots(image_id, img_name, row_id, keep_obs=True)
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1198,7 +1560,8 @@ def startup():
     init_db()
     reload_schedules()
     scheduler.start()
-    log.info('App started. Region=%s ProjectID=%s', REGION, get_project_id())
+    pid = get_project_id()
+    log.info('App started. Region=%s ProjectID=%s OBS_Bucket=%s', REGION, pid, 'bkp2ims-%s' % pid)
 
 startup()
 
