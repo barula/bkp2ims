@@ -1227,6 +1227,22 @@ def reload_schedules():
 def index():
     return send_from_directory(app.static_folder, 'index.html')
 
+@app.route('/api/ims_quota')
+def api_ims_quota():
+    try:
+        r = hwc_request('GET', '%s/v1/cloudimages/quota' % IMS_ENDPOINT)
+        if r.status_code != 200:
+            return jsonify({'error': 'HTTP %s' % r.status_code}), 502
+        resources = r.json().get('quotas', {}).get('resources', [])
+        for res in resources:
+            if res.get('type') == 'image':
+                used = res.get('used', 0)
+                quota = res.get('quota', 0)
+                return jsonify({'used': used, 'quota': quota, 'available': quota - used})
+        return jsonify({'error': 'No image quota found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/status')
 def api_status():
     try:
