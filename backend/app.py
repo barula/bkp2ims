@@ -340,22 +340,38 @@ def _create_volume_image(volume_id, name, os_version, description='', patch_data
         time.sleep(15)
     raise Exception('Volume image job timed out (job_id=%s)' % job_id)
 
-def _backup_single_data_disk(dv, backup_row_id, schedule_id, ecs_id, ts, description):
-    """Create IMS image for one data disk and register it. Called in parallel threads."""
-    dv_safe = ''.join(c if c.isalnum() or c == '-' else '-' for c in dv.get('name', 'vol'))[:20]
-    dv_img_name = 'bkp-data-%s-%s' % (dv_safe, ts)
-    log.info('Creating IMS image for data disk %s (%s GB) device=%s',
-             dv['id'][:8], dv.get('size'), dv.get('device', ''))
-    dv_image_id = _create_volume_image(dv['id'], dv_img_name, 'Other Linux(64 bit)',
-                                       description=description, patch_data_image=True)
-    conn = get_db()
-    _register_data_image(conn, backup_row_id, schedule_id, ecs_id,
-                         dv_image_id, dv_img_name, dv['id'], dv.get('size'),
-                         dv.get('device', ''), dv.get('type', ''))
-    conn.commit()
-    conn.close()
-    log.info('Data disk IMS image registered: %s device=%s', dv_image_id[:8], dv.get('device', ''))
-    return dv_img_name
+def _backup_single_disk(vol, is_system, backup_row_id, schedule_id, ecs_id, ts,
+                        description, sys_img_name, sys_os_version):
+    """Backup one disk via IMS. Runs in its own thread (all disks fire in parallel).
+    System disk: image from instance_id → updates backup_images.image_id when done.
+    Data disk:   image from volume_id  → inserts into backup_snapshots.
+    """
+    if is_system:
+        log.info('Creating system disk image from instance %s os=%s', ecs_id[:8], sys_os_version)
+        img_id = _create_volume_image(None, sys_img_name, sys_os_version,
+                                      description=description, patch_data_image=False,
+                                      instance_id=ecs_id)
+        conn = get_db()
+        conn.execute('UPDATE backup_images SET image_id=? WHERE id=?', (img_id, backup_row_id))
+        conn.commit()
+        conn.close()
+        log.info('System disk image registered: %s', img_id[:8])
+        return img_id
+    else:
+        dv_safe = ''.join(c if c.isalnum() or c == '-' else '-' for c in vol.get('name', 'vol'))[:20]
+        dv_img_name = 'bkp-data-%s-%s' % (dv_safe, ts)
+        log.info('Creating IMS image for data disk %s (%s GB) device=%s',
+                 vol['id'][:8], vol.get('size'), vol.get('device', ''))
+        img_id = _create_volume_image(vol['id'], dv_img_name, 'Other Linux(64 bit)',
+                                      description=description, patch_data_image=True)
+        conn = get_db()
+        _register_data_image(conn, backup_row_id, schedule_id, ecs_id,
+                             img_id, dv_img_name, vol['id'], vol.get('size'),
+                             vol.get('device', ''), vol.get('type', ''))
+        conn.commit()
+        conn.close()
+        log.info('Data disk IMS image registered: %s device=%s', img_id[:8], vol.get('device', ''))
+        return dv_img_name
 
 def _register_data_image(conn, backup_row_id, schedule_id, ecs_id, image_id, image_name, volume_id, size_gb, device='', volume_type=''):
     """Register a data disk IMS image in backup_snapshots table."""
@@ -488,13 +504,9 @@ def run_backup(schedule_id):
         description = ('Backup automatico. Programacion: %s. Discos: %s' % (
             sched['name'], ' | '.join(vol_lines) if vol_lines else '-'))[:255]
 
-        image_id    = None
-        backup_row_id = None
-
-        # ── System disk: IMS image via volume_id (correct min_disk) ─────────
+        # ── Detectar OS version del disco de sistema (rápido, antes del paralelismo) ──
+        sys_os_version = 'Other Linux(64 bit)'
         if system_vol:
-            # Detect OS version from ECS image metadata
-            sys_os_version = 'Other Linux(64 bit)'
             try:
                 er = hwc_request('GET', '%s/v2/%s/servers/%s' % (ECS_ENDPOINT, project_id, sched['ecs_id']))
                 src_img_id = er.json().get('server', {}).get('image', {}).get('id', '')
@@ -506,64 +518,61 @@ def run_backup(schedule_id):
                         sys_os_version = imgs[0].get('__os_version', sys_os_version)
             except Exception:
                 pass
-            log.info('Creating system disk image from instance %s os=%s', sched['ecs_id'][:8], sys_os_version)
-            image_id = _create_volume_image(None, image_name, sys_os_version,
-                                            description=description, patch_data_image=False,
-                                            instance_id=sched['ecs_id'])
 
-            finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            conn = get_db()
-            cur = conn.execute(
-                'INSERT OR IGNORE INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
-                (schedule_id, sched['ecs_id'], sched['ecs_name'], image_id, image_name, finished_str)
-            )
-            backup_row_id = cur.lastrowid
-            conn.commit()
-            conn.close()
-            log.info('System disk image registered: image_id=%s', image_id)
+        # ── Crear row en backup_images antes de lanzar threads ───────────────
+        # image_id arranca como 'pending' y el thread del sistema lo actualiza al terminar.
+        # Si no hay disco de sistema, queda como 'data-only'.
+        placeholder = 'pending' if system_vol else 'data-only'
+        conn = get_db()
+        cur = conn.execute(
+            'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
+            (schedule_id, sched['ecs_id'], sched['ecs_name'], placeholder, image_name, now_str)
+        )
+        backup_row_id = cur.lastrowid
+        conn.commit()
+        conn.close()
 
-        # ── Data disks: IMS image via POST /v2/cloudimages/action ───────────
-        if data_vols:
-            if backup_row_id is None:
-                # No system image — create a placeholder backup_images row to anchor data images
-                ph_name = image_name + '-data'
-                finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                conn = get_db()
-                cur = conn.execute(
-                    'INSERT INTO backup_images (schedule_id, ecs_id, ecs_name, image_id, image_name, created_at) VALUES (?,?,?,?,?,?)',
-                    (schedule_id, sched['ecs_id'], sched['ecs_name'], 'data-only', ph_name, finished_str)
-                )
-                backup_row_id = cur.lastrowid
-                conn.commit()
-                conn.close()
+        # ── Lanzar TODOS los discos en paralelo ──────────────────────────────
+        log.info('Backing up %d disk(s) in parallel (all at once)', len(target_vols))
+        with ThreadPoolExecutor(max_workers=len(target_vols)) as executor:
+            futures = {
+                executor.submit(
+                    _backup_single_disk,
+                    vol,
+                    vol is system_vol,   # is_system
+                    backup_row_id, schedule_id, sched['ecs_id'], ts,
+                    description, image_name, sys_os_version
+                ): vol
+                for vol in target_vols
+            }
+            errors = []
+            sys_image_id = None
+            for future in as_completed(futures):
+                vol = futures[future]
+                try:
+                    result = future.result()
+                    if vol is system_vol:
+                        sys_image_id = result
+                except Exception as e:
+                    errors.append('device %s: %s' % (vol.get('device', vol['id'][:8]), e))
+                    log.error('Disk backup failed for %s: %s', vol.get('device', ''), e)
+            if errors:
+                raise Exception('Fallo backup de disco(s): ' + '; '.join(errors))
 
-            log.info('Backing up %d data disk(s) in parallel', len(data_vols))
-            with ThreadPoolExecutor(max_workers=len(data_vols)) as executor:
-                futures = {
-                    executor.submit(_backup_single_data_disk, dv, backup_row_id,
-                                    schedule_id, sched['ecs_id'], ts, description): dv
-                    for dv in data_vols
-                }
-                errors = []
-                for future in as_completed(futures):
-                    dv = futures[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        errors.append('device %s: %s' % (dv.get('device', dv['id'][:8]), e))
-                        log.error('Data disk backup failed for %s: %s', dv.get('device', ''), e)
-                if errors:
-                    raise Exception('Fallo backup de disco(s) de datos: ' + '; '.join(errors))
-
-        # ── Finalize job history ─────────────────────────────────────────────
+        # ── Finalizar job history ────────────────────────────────────────────
         finished_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        msg = 'Sistema: imagen IMS' if system_vol else ''
-        if data_vols:
-            msg += ('%s | ' % (' + ' if msg else '')) + 'Datos: %d imagen(es) IMS' % len(data_vols)
+        n_data = len(data_vols)
+        msg_parts = []
+        if system_vol:
+            msg_parts.append('Sistema: imagen IMS')
+        if n_data:
+            msg_parts.append('Datos: %d imagen(es) IMS' % n_data)
+        msg = ' + '.join(msg_parts) or 'Backup completado'
+        final_img_id = sys_image_id or 'data-only'
         conn = get_db()
         conn.execute(
             'UPDATE job_history SET status=?, image_id=?, image_name=?, finished_at=?, message=? WHERE id=?',
-            ('success', image_id or 'data-only', image_name, finished_str, msg or 'Backup completado', job_id_db)
+            ('success', final_img_id, image_name, finished_str, msg, job_id_db)
         )
         conn.commit()
         conn.close()
@@ -1195,3 +1204,4 @@ startup()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000, debug=False)
+
