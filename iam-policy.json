@@ -1,0 +1,97 @@
+{
+  "Version": "1.1",
+  "Statement": [
+    {
+      "Sid": "ECS-ReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:servers:list",
+        "ecs:servers:get",
+        "ecs:serverVolumes:list"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ECS-PowerControl",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:servers:stop",
+        "ecs:servers:start"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ECS-VolumeAttachment",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:serverVolumeAttachments:create",
+        "ecs:serverVolumeAttachments:delete"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ECS-ChangeOS",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:servers:changeOS"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ECS-Jobs",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:jobs:get"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "EVS-ReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "evs:volumes:get",
+        "evs:volumes:list"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "EVS-Snapshots",
+      "Effect": "Allow",
+      "Action": [
+        "evs:snapshots:create",
+        "evs:snapshots:get",
+        "evs:snapshots:delete"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "EVS-Volumes-Restore",
+      "Effect": "Allow",
+      "Action": [
+        "evs:volumes:create",
+        "evs:jobs:get"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "IMS-ReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ims:images:list",
+        "ims:images:get"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "IMS-Backup",
+      "Effect": "Allow",
+      "Action": [
+        "ims:images:create",
+        "ims:images:update",
+        "ims:images:delete",
+        "ims:jobs:get"
+      ],
+      "Resource": ["*"]
+    }
+  ]
+}
