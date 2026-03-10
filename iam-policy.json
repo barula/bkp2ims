@@ -6,7 +6,6 @@
       "Action": [
         "ecs:servers:list",
         "ecs:servers:get",
-        "ecs:serverVolumes:list",
         "ecs:servers:stop",
         "ecs:servers:start",
         "ecs:serverVolumeAttachments:create",
