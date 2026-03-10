@@ -55,16 +55,6 @@
       "Resource": ["*"]
     },
     {
-      "Sid": "EVS-Snapshots",
-      "Effect": "Allow",
-      "Action": [
-        "evs:snapshots:create",
-        "evs:snapshots:get",
-        "evs:snapshots:delete"
-      ],
-      "Resource": ["*"]
-    },
-    {
       "Sid": "EVS-Volumes-Restore",
       "Effect": "Allow",
       "Action": [
