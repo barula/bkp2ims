@@ -492,7 +492,12 @@ def _obs_request(method, resource, body=b'', content_type='application/xml'):
     for k, v in obs_headers.items():
         headers[k] = v
 
-    url = 'https://obs.%s.myhuaweicloud.com%s' % (REGION, resource)
+    # sa-argentina-1 (and other LATAM regions) require virtual-hosted style URLs
+    # resource = '/bucket/key' → host = bucket.obs.region..., path = /key
+    parts = resource.lstrip('/').split('/', 1)
+    bucket_name = parts[0]
+    obj_path = ('/' + parts[1]) if len(parts) > 1 else '/'
+    url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (bucket_name, REGION, obj_path)
     return requests.request(method, url, headers=headers, data=body or None, timeout=30)
 
 def _ensure_obs_bucket():
