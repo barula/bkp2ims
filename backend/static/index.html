@@ -178,6 +178,8 @@
   .badge-warning { background: var(--warning-bg); color: var(--warning); }
   .badge-running { background: var(--running-bg); color: var(--running); }
   .badge-running .badge-dot { background: var(--running); animation: pulse 1.5s infinite; }
+  .badge-external { background: #e8f4f8; color: #0077b6; }
+  .badge-obs-only { background: #fff3cd; color: #856404; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 
   /* ── Detail panel ── */
@@ -277,6 +279,8 @@
   .btn-danger:hover { background: var(--error-bg); border-color: var(--error); }
   .btn-restore { background: transparent; color: var(--warning); border-color: var(--border); }
   .btn-restore:hover { background: var(--warning-bg); border-color: var(--warning); }
+  .btn-export { background: transparent; color: var(--accent); border-color: var(--border); }
+  .btn-export:hover { background: var(--accent-light); border-color: var(--accent); }
   .btn-sm { padding: 4px 10px; font-size: 12px; }
   .btn-icon { padding: 6px; border-radius: var(--radius-sm); }
   .toggle-btn {
@@ -1084,16 +1088,20 @@ async function loadHistory() {
     const snaps = (await sr.json()).snapshots || [];
     const imgs  = (await ir.json()).images || [];
 
-    // Map image_id -> backup_images row (for restore button)
+    // Map image_id -> backup_images row; also index by DB id
     const imagesByImageId = {};
-    imgs.forEach(img => { imagesByImageId[img.image_id] = img; });
+    const imagesById = {};
+    imgs.forEach(img => {
+      imagesByImageId[img.image_id] = img;
+      imagesById[img.id] = img;
+    });
 
     // Group snapshots by backup_image_id
-    const snapsByImageName = {};
+    const snapsByBackupId = {};
     snaps.forEach(s => {
-      const imgName = s.snapshot_name.replace(/^snapshot for /, '');
-      if (!snapsByImageName[imgName]) snapsByImageName[imgName] = [];
-      snapsByImageName[imgName].push(s);
+      const bid = s.backup_image_id;
+      if (!snapsByBackupId[bid]) snapsByBackupId[bid] = [];
+      snapsByBackupId[bid].push(s);
     });
 
     if (!items.length) {
@@ -1101,31 +1109,64 @@ async function loadHistory() {
       return;
     }
     c.innerHTML = items.map(h => {
-      const relSnaps = h.image_name ? (snapsByImageName[h.image_name] || []) : [];
+      // Find backup_images row: match by image_id from job_history
+      const bkpImg = (h.image_id && imagesByImageId[h.image_id]) || null;
+      const relSnaps = bkpImg ? (snapsByBackupId[bkpImg.id] || []) : [];
+
+      // OBS status badges for the system image
+      let obsBadge = '';
+      if (bkpImg) {
+        if (bkpImg.obs_status === 'exporting') {
+          obsBadge = `&middot; <span class="badge badge-running"><div class="spinner" style="width:8px;height:8px;border-width:1.5px;display:inline-block;vertical-align:middle;margin-right:3px"></div>exportando a OBS</span>`;
+        } else if (bkpImg.obs_status === 'exported' || bkpImg.obs_status === 'failed') {
+          const cls = bkpImg.obs_status === 'exported' ? 'badge-external' : 'badge-error';
+          const lbl = bkpImg.obs_status === 'exported'
+            ? (bkpImg.ims_deleted ? 'solo OBS' : 'external')
+            : 'export fallido';
+          obsBadge = `&middot; <span class="badge ${cls}" title="${esc(bkpImg.obs_url || '')}">${lbl}</span>`;
+        }
+      }
+
       const snapInfo = relSnaps.length
         ? `&middot; ` + relSnaps.map(s => {
             const role = s.volume_role === 'system' ? 'Sistema' : 'Datos';
             const cls  = s.volume_role === 'system' ? 'badge-info' : 'badge-warning';
-            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB IMS</span>`;
+            const obsTag = s.obs_status === 'exported' ? ' <span class="badge badge-external" style="font-size:9px;padding:0 4px">OBS</span>' : '';
+            return `<span class="badge ${cls}" title="${esc(s.snapshot_id)}">${role} ${s.size_gb}GB IMS${obsTag}</span>`;
           }).join(' ')
         : '';
-      const bkpImg = h.image_id ? imagesByImageId[h.image_id] : null;
-      const restoreBtn = (h.status === 'success' && bkpImg)
-        ? `<button class="btn btn-restore btn-sm" onclick="confirmRestore(${bkpImg.id}, '${esc(h.ecs_name)}', '${esc(h.image_name)}')">Restaurar</button>`
+
+      // Determine if restore is possible (IMS or OBS)
+      const canRestore = h.status === 'success' && bkpImg &&
+        (bkpImg.image_id && !['pending','data-only'].includes(bkpImg.image_id) ||
+         (bkpImg.obs_url && bkpImg.ims_deleted));
+      const restoreBtn = canRestore
+        ? `<button class="btn btn-restore btn-sm" onclick="confirmRestore(${bkpImg.id}, '${esc(h.ecs_name)}', '${esc(h.image_name)}', ${!!bkpImg.ims_deleted})">Restaurar</button>`
         : '';
+
+      // Export button: show when backup succeeded, has system image in IMS, no export yet
+      const canExport = h.status === 'success' && bkpImg &&
+        bkpImg.image_id && !['pending','data-only'].includes(bkpImg.image_id) &&
+        !bkpImg.obs_status;
+      const exportBtn = canExport
+        ? `<button class="btn btn-export btn-sm" onclick="exportToOBS(${bkpImg.id})" title="Exportar a OBS">OBS</button>`
+        : '';
+
       return `
-      <div class="history-item">
+      <div class="history-item" id="hist-${bkpImg ? bkpImg.id : h.id}">
         ${statusIcon(h.status)}
         <div class="history-body">
           <div class="history-title">${esc(h.ecs_name || '—')} &mdash; <span class="text-muted">${esc(h.schedule_name || '—')}</span></div>
           <div class="history-sub">
             ${h.image_name ? `<span class="text-mono">${esc(h.image_name)}</span> &middot; ` : ''}
             <span class="badge ${h.status==='success'?'badge-active':h.status==='failed'?'badge-error':'badge-running'}">${h.status}</span>
+            ${obsBadge}
             ${snapInfo}
             ${h.message && h.status !== 'success' ? `&middot; ${esc(h.message.slice(0,120))}` : ''}
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          ${exportBtn}
           ${restoreBtn}
           <div class="history-time">${fmtDate(h.started_at)}</div>
         </div>
@@ -1136,13 +1177,31 @@ async function loadHistory() {
   }
 }
 
+// ── OBS Export ──────────────────────────────────────────────────────────────
+async function exportToOBS(backupId) {
+  if (!confirm('Exportar este backup a OBS?\n\nEl proceso puede tardar varios minutos por cada disco. La imagen IMS permanece intacta.')) return;
+  try {
+    const r = await fetch(`${API}/api/images/${backupId}/export`, {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      toast(`Export iniciado. Bucket: ${d.bucket}`, 'success');
+      setTimeout(() => loadHistory(), 1500);
+    } else {
+      toast('Error: ' + (d.error || 'desconocido'), 'error');
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
 // ── Restore ─────────────────────────────────────────────────────────────────
 let pendingRestoreId = null;
 
-function confirmRestore(backupImageId, ecsName, imageName) {
+function confirmRestore(backupImageId, ecsName, imageName, fromOBS) {
   pendingRestoreId = backupImageId;
+  const obsNote = fromOBS
+    ? `<div style="margin-top:8px;padding:6px 10px;background:var(--accent-light);border-radius:6px;font-size:12px;color:var(--accent)">La imagen sera importada desde OBS antes de restaurar (puede tardar varios minutos).</div>`
+    : '';
   document.getElementById('restore-modal-info').innerHTML =
-    `<strong>ECS:</strong> ${esc(ecsName)}<br><strong>Backup:</strong> ${esc(imageName)}`;
+    `<strong>ECS:</strong> ${esc(ecsName)}<br><strong>Backup:</strong> ${esc(imageName)}${obsNote}`;
   document.getElementById('restore-modal-backdrop').classList.add('visible');
 }
 
