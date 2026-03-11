@@ -603,30 +603,23 @@ def _export_backup_to_obs(backup_image_id):
     elif bimg.get('obs_url'):
         log.info('System image already exported: %s', bimg['obs_url'])
 
-    # Export data disk images in parallel
-    def _export_data_item(item):
+    # Export data disk images sequentially (avoid hitting the rate limit on the export API)
+    for item in data_items:
         if item.get('obs_url'):
-            return
-        obs_file = '%s.zvhd2' % item['snapshot_name']
-        obs_url = _export_image_to_obs(item['snapshot_id'], obs_file)
-        conn = get_db()
-        conn.execute(
-            'UPDATE backup_snapshots SET obs_url=?, obs_status=? WHERE id=?',
-            (obs_url, 'exported', item['id'])
-        )
-        conn.commit(); conn.close()
-        log.info('Data image exported to OBS: %s', obs_url)
-
-    if data_items:
-        with ThreadPoolExecutor(max_workers=len(data_items)) as executor:
-            futures = {executor.submit(_export_data_item, item): item for item in data_items}
-            for future in as_completed(futures):
-                item = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    errors.append('datos %s: %s' % (item.get('device', item['snapshot_id'][:8]), e))
-                    log.error('Export data image %s: %s', item['snapshot_id'][:8], e)
+            continue
+        try:
+            obs_file = '%s.zvhd2' % item['snapshot_name']
+            obs_url = _export_image_to_obs(item['snapshot_id'], obs_file)
+            conn = get_db()
+            conn.execute(
+                'UPDATE backup_snapshots SET obs_url=?, obs_status=? WHERE id=?',
+                (obs_url, 'exported', item['id'])
+            )
+            conn.commit(); conn.close()
+            log.info('Data image exported to OBS: %s', obs_url)
+        except Exception as e:
+            errors.append('datos %s: %s' % (item.get('device', item['snapshot_id'][:8]), e))
+            log.error('Export data image %s: %s', item['snapshot_id'][:8], e)
 
     # Set final status on backup_images if system was exported
     if sys_img_id and sys_img_id not in ('pending', 'data-only'):
@@ -637,6 +630,14 @@ def _export_backup_to_obs(backup_image_id):
             (final_status, backup_image_id)
         )
         conn.commit(); conn.close()
+
+    if not errors:
+        # All exported → delete IMS images to free quota, keep OBS refs for restore
+        log.info('All images exported to OBS, deleting IMS images for backup %d', backup_image_id)
+        delete_image_and_snapshots(
+            bimg.get('image_id', ''), bimg.get('image_name', ''),
+            backup_image_id, keep_obs=True
+        )
 
     if errors:
         log.error('Export backup %d finished with errors: %s', backup_image_id, '; '.join(errors))
