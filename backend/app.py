@@ -532,6 +532,10 @@ def _export_image_to_obs(image_id, obs_filename):
     body = {'bucket_url': '%s:%s' % (bucket, obs_filename), 'is_quick_export': True, 'file_type': 'zvhd2'}
     r = hwc_request('POST', '%s/v1/cloudimages/%s/file' % (IMS_ENDPOINT, image_id), body=body)
     if r.status_code not in (200, 202):
+        # IMG.0070 = file already exists in OBS → treat as already exported
+        if r.status_code == 400 and 'IMG.0070' in r.text:
+            log.info('IMS export skipped (file already in OBS): %s → %s', image_id[:8], obs_url)
+            return obs_url
         raise Exception('IMS export HTTP %s: %s' % (r.status_code, r.text[:300]))
     resp_data = r.json()
     job_id = resp_data.get('job_id') or (resp_data.get('body') or {}).get('job_id')
