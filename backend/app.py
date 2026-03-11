@@ -529,7 +529,7 @@ def _export_image_to_obs(image_id, obs_filename):
     bucket = get_obs_bucket()
     obs_url = 'obs://%s/%s' % (bucket, obs_filename)
     project_id = get_project_id()
-    body = {'bucket_url': obs_url, 'file_type': 'zvhd2'}
+    body = {'bucket_url': '%s:%s' % (bucket, obs_filename), 'is_quick_export': True, 'file_type': 'zvhd2'}
     r = hwc_request('POST', '%s/v1/cloudimages/%s/file' % (IMS_ENDPOINT, image_id), body=body)
     if r.status_code not in (200, 202):
         raise Exception('IMS export HTTP %s: %s' % (r.status_code, r.text[:300]))
