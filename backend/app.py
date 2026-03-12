@@ -191,6 +191,7 @@ def init_db():
         'ALTER TABLE backup_snapshots ADD COLUMN ims_deleted INTEGER DEFAULT 0',
         'ALTER TABLE backup_snapshots ADD COLUMN obs_dr_url TEXT',
         'ALTER TABLE backup_snapshots ADD COLUMN obs_dr_status TEXT',
+        'ALTER TABLE schedules ADD COLUMN policy_id INTEGER',
     ]:
         try:
             conn.execute(migration)
@@ -258,6 +259,13 @@ def init_db():
             message TEXT,
             started_at TEXT NOT NULL,
             finished_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS policies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            frequency_hours INTEGER NOT NULL DEFAULT 24,
+            retention_count INTEGER NOT NULL DEFAULT 7,
+            created_at TEXT NOT NULL
         );
     ''')
     conn.commit()
@@ -1835,6 +1843,129 @@ def api_snapshots():
     rows = conn.execute(q, params).fetchall()
     conn.close()
     return jsonify({'snapshots': [dict(r) for r in rows]})
+
+@app.route('/api/policies', methods=['GET'])
+def api_list_policies():
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT p.*, COUNT(s.id) as ecs_count FROM policies p '
+        'LEFT JOIN schedules s ON s.policy_id=p.id GROUP BY p.id ORDER BY p.created_at DESC'
+    ).fetchall()
+    conn.close()
+    return jsonify({'policies': [dict(r) for r in rows]})
+
+@app.route('/api/policies', methods=['POST'])
+def api_create_policy():
+    data = request.json
+    for f in ['name', 'frequency_hours', 'retention_count']:
+        if f not in data:
+            return jsonify({'error': 'Missing field: %s' % f}), 400
+    now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn = get_db()
+    cur = conn.execute(
+        'INSERT INTO policies (name, frequency_hours, retention_count, created_at) VALUES (?,?,?,?)',
+        (data['name'], int(data['frequency_hours']), int(data['retention_count']), now_str)
+    )
+    policy_id = cur.lastrowid
+    conn.commit(); conn.close()
+    return jsonify({'id': policy_id}), 201
+
+@app.route('/api/policies/<int:policy_id>', methods=['PUT'])
+def api_update_policy(policy_id):
+    data = request.json
+    conn = get_db()
+    p = conn.execute('SELECT * FROM policies WHERE id=?', (policy_id,)).fetchone()
+    if not p:
+        conn.close()
+        return jsonify({'error': 'Not found'}), 404
+    name = data.get('name', p['name'])
+    freq = int(data.get('frequency_hours', p['frequency_hours']))
+    ret  = int(data.get('retention_count', p['retention_count']))
+    conn.execute('UPDATE policies SET name=?, frequency_hours=?, retention_count=? WHERE id=?',
+                 (name, freq, ret, policy_id))
+    scheds = conn.execute('SELECT id FROM schedules WHERE policy_id=?', (policy_id,)).fetchall()
+    next_run = (datetime.datetime.utcnow() +
+                datetime.timedelta(hours=freq)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    for s in scheds:
+        conn.execute('UPDATE schedules SET frequency_hours=?, retention_count=?, next_run=? WHERE id=?',
+                     (freq, ret, next_run, s['id']))
+        add_scheduler_job(s['id'], freq)
+    conn.commit(); conn.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/policies/<int:policy_id>', methods=['DELETE'])
+def api_delete_policy(policy_id):
+    conn = get_db()
+    count = conn.execute('SELECT COUNT(*) FROM schedules WHERE policy_id=?', (policy_id,)).fetchone()[0]
+    if count > 0:
+        conn.close()
+        return jsonify({'error': 'Hay %d ECS asignadas. Desasignalas primero.' % count}), 409
+    conn.execute('DELETE FROM policies WHERE id=?', (policy_id,))
+    conn.commit(); conn.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/policies/<int:policy_id>/assign', methods=['POST'])
+def api_assign_policy(policy_id):
+    data = request.json
+    if not data or 'ecs_id' not in data or 'ecs_name' not in data:
+        return jsonify({'error': 'Missing ecs_id or ecs_name'}), 400
+    conn = get_db()
+    p = conn.execute('SELECT * FROM policies WHERE id=?', (policy_id,)).fetchone()
+    if not p:
+        conn.close()
+        return jsonify({'error': 'Policy not found'}), 404
+    existing = conn.execute('SELECT id FROM schedules WHERE policy_id=? AND ecs_id=?',
+                            (policy_id, data['ecs_id'])).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({'error': 'Esta ECS ya esta asignada a esta politica'}), 409
+    now_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    next_run = (datetime.datetime.utcnow() +
+                datetime.timedelta(hours=p['frequency_hours'])).strftime('%Y-%m-%dT%H:%M:%SZ')
+    selected_volumes = json.dumps(data.get('selected_volumes', []))
+    sched_name = '%s - %s' % (p['name'], data['ecs_name'])
+    cur = conn.execute(
+        'INSERT INTO schedules (name, ecs_id, ecs_name, frequency_hours, retention_count, '
+        'enabled, created_at, next_run, selected_volumes, policy_id) VALUES (?,?,?,?,?,1,?,?,?,?)',
+        (sched_name, data['ecs_id'], data['ecs_name'],
+         p['frequency_hours'], p['retention_count'],
+         now_str, next_run, selected_volumes, policy_id)
+    )
+    sched_id = cur.lastrowid
+    conn.commit(); conn.close()
+    add_scheduler_job(sched_id, p['frequency_hours'])
+    return jsonify({'ok': True, 'schedule_id': sched_id}), 201
+
+@app.route('/api/policies/<int:policy_id>/ecs/<ecs_id>', methods=['DELETE'])
+def api_unassign_policy(policy_id, ecs_id):
+    conn = get_db()
+    sched = conn.execute('SELECT id FROM schedules WHERE policy_id=? AND ecs_id=?',
+                         (policy_id, ecs_id)).fetchone()
+    if not sched:
+        conn.close()
+        return jsonify({'error': 'Not found'}), 404
+    sched_id = sched['id']
+    conn.execute('DELETE FROM schedules WHERE id=?', (sched_id,))
+    conn.commit(); conn.close()
+    remove_scheduler_job(sched_id)
+    return jsonify({'ok': True})
+
+@app.route('/api/ecs/<ecs_id>/backups')
+def api_ecs_backups(ecs_id):
+    conn = get_db()
+    imgs = conn.execute(
+        'SELECT * FROM backup_images WHERE ecs_id=? AND deleted=0 ORDER BY created_at DESC',
+        (ecs_id,)
+    ).fetchall()
+    imgs = [dict(r) for r in imgs]
+    for img in imgs:
+        snaps = conn.execute(
+            'SELECT * FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+            (img['id'],)
+        ).fetchall()
+        img['snapshots'] = [dict(s) for s in snaps]
+    conn.close()
+    return jsonify({'backups': imgs})
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 

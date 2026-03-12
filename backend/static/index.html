@@ -225,6 +225,85 @@
   .sched-table tr:last-child td { border-bottom: none; }
   .sched-table tr:hover td { background: var(--bg); }
 
+  /* ── Backup table ── */
+  .bkp-table { width: 100%; border-collapse: collapse; }
+  .bkp-table th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    white-space: nowrap;
+  }
+  .bkp-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-light);
+    vertical-align: middle;
+    font-size: 13px;
+  }
+  .bkp-table tr:last-child td { border-bottom: none; }
+  .bkp-table tr:hover td { background: var(--bg); }
+
+  /* ── Policy cards ── */
+  .policy-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 12px;
+  }
+  .policy-card-header {
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .policy-card-title { font-size: 14px; font-weight: 600; }
+  .policy-card-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .policy-card-body { padding: 0 18px 14px; }
+  .policy-ecs-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    margin-bottom: 6px;
+    font-size: 13px;
+    background: var(--bg);
+  }
+  .policy-ecs-row:last-child { margin-bottom: 0; }
+  .policy-ecs-name { font-weight: 500; }
+  .policy-ecs-list-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    margin-top: 4px;
+  }
+
+  /* ── ECS Policy section ── */
+  .policy-assigned-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    margin-bottom: 6px;
+    font-size: 13px;
+    background: var(--accent-light);
+  }
+  .policy-assigned-name { font-weight: 500; color: var(--accent); }
+
   /* ── History ── */
   .history-item {
     display: flex;
@@ -462,6 +541,7 @@
 
 <nav>
   <div class="tab active" onclick="switchTab('ecs')">Instancias ECS</div>
+  <div class="tab" onclick="switchTab('policies')">Politicas</div>
   <div class="tab" onclick="switchTab('schedules')">Programaciones</div>
   <div class="tab" onclick="switchTab('history')">Historial</div>
 </nav>
@@ -502,6 +582,44 @@
         </div>
         <div id="ecs-sched-container"></div>
       </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="card-header">
+          <h2>Backups vigentes</h2>
+        </div>
+        <div id="ecs-backups-container"><div class="loading-row"><div class="spinner"></div></div></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="card-header">
+          <h2>Politica asociada</h2>
+          <button class="btn btn-ghost btn-sm" onclick="openAssignPolicyModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Asignar a politica
+          </button>
+        </div>
+        <div id="ecs-policies-container"><div class="loading-row"><div class="spinner"></div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TAB: Policies ── -->
+  <div id="tab-policies" class="section">
+    <div class="section-toolbar">
+      <span class="section-title">Politicas de backup</span>
+      <div class="flex gap-2">
+        <button class="btn btn-ghost btn-sm" onclick="loadPolicies()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Actualizar
+        </button>
+        <button class="btn btn-primary btn-sm" onclick="openNewPolicyModal()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Nueva politica
+        </button>
+      </div>
+    </div>
+    <div id="policies-container">
+      <div class="loading-row"><div class="spinner"></div></div>
     </div>
   </div>
 
@@ -614,6 +732,107 @@
   </div>
 </div>
 
+<!-- ── Modal: New/Edit Policy ── -->
+<div id="policy-modal-backdrop" class="modal-backdrop">
+  <div class="modal" style="max-width:440px">
+    <div class="modal-header">
+      <h3 id="policy-modal-title">Nueva politica</h3>
+      <button class="close-btn" onclick="closePolicyModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Nombre de la politica</label>
+        <input type="text" id="p-name" placeholder="ej. Backup diario produccion">
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Frecuencia</label>
+          <select id="p-freq-preset" onchange="onPolicyFreqPreset()">
+            <option value="1">Cada hora</option>
+            <option value="6">Cada 6 horas</option>
+            <option value="12">Cada 12 horas</option>
+            <option value="24" selected>Diario</option>
+            <option value="48">Cada 2 dias</option>
+            <option value="72">Cada 3 dias</option>
+            <option value="168">Semanal</option>
+            <option value="custom">Personalizado...</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Retener (imagenes)</label>
+          <input type="number" id="p-retention" value="7" min="1" max="365" placeholder="7">
+          <div class="input-hint">Ultimas N imagenes por ECS</div>
+        </div>
+      </div>
+      <div class="form-group" id="p-custom-hours-group" style="display:none">
+        <label>Intervalo en horas</label>
+        <input type="number" id="p-custom-hours" min="1" max="8760" placeholder="24">
+      </div>
+      <div id="p-freq-summary" class="freq-display"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closePolicyModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="savePolicy()" id="btn-save-policy">Crear politica</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Assign ECS to Policy ── -->
+<div id="assign-ecs-modal-backdrop" class="modal-backdrop">
+  <div class="modal" style="max-width:480px">
+    <div class="modal-header">
+      <h3 id="assign-ecs-modal-title">Asignar ECS a politica</h3>
+      <button class="close-btn" onclick="closeAssignEcsModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Instancia ECS</label>
+        <select id="assign-ecs-select" onchange="onAssignEcsSelect()">
+          <option value="">-- Seleccionar ECS --</option>
+        </select>
+      </div>
+      <div id="assign-ecs-disks" style="display:none">
+        <div class="form-group">
+          <label>Discos a respaldar (opcional)</label>
+          <div id="assign-ecs-disk-list" style="display:flex;flex-direction:column;gap:6px;margin-top:4px"></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeAssignEcsModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="assignEcsToPolicy()" id="btn-assign-ecs">Asignar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Assign Policy to ECS ── -->
+<div id="assign-policy-modal-backdrop" class="modal-backdrop">
+  <div class="modal" style="max-width:400px">
+    <div class="modal-header">
+      <h3>Asignar a politica</h3>
+      <button class="close-btn" onclick="closeAssignPolicyModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Politica</label>
+        <select id="assign-policy-select">
+          <option value="">-- Seleccionar politica --</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeAssignPolicyModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="assignPolicyToECS()" id="btn-assign-policy">Asignar</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast-container"></div>
 
 <script>
@@ -621,6 +840,11 @@ const API = '';
 let selectedECS = null;
 let selectedECSVolumes = [];
 let editingScheduleId = null;
+let editingPolicyId = null;
+let assignToPolicyId = null;
+let assignToPolicyName = null;
+let cachedECSList = [];
+let cachedPolicies = [];
 
 // ── Toast ──────────────────────────────────────────────────────────────────
 function toast(msg, type = '') {
@@ -654,14 +878,15 @@ async function loadStatus() {
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['ecs','schedules','history'];
-    t.classList.toggle('active', names[i] === name);
+  const tabNames = ['ecs', 'policies', 'schedules', 'history'];
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    t.classList.toggle('active', tabNames[i] === name);
   });
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
   document.getElementById(`tab-${name}`).classList.add('active');
   if (name === 'schedules') loadSchedules();
   if (name === 'history') { loadHistory(); loadRestoreHistory(); }
+  if (name === 'policies') loadPolicies();
 }
 
 // ── ECS ────────────────────────────────────────────────────────────────────
@@ -687,6 +912,9 @@ async function loadECS() {
     ]);
     const d = await er.json();
     const q = await qr.json();
+
+    // Cache ECS list for use in policy assign modal
+    cachedECSList = d.servers || [];
 
     // Render quota bar
     const qEl = document.getElementById('ims-quota-bar');
@@ -745,9 +973,11 @@ async function selectECS(server) {
   panel.classList.add('visible');
   document.getElementById('detail-title').textContent = `Discos — ${server.name}`;
 
-  // Load volumes
+  // Reset containers with loaders
   document.getElementById('vol-container').innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
   document.getElementById('ecs-sched-container').innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  document.getElementById('ecs-backups-container').innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  document.getElementById('ecs-policies-container').innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
 
   try {
     const [vr, sr] = await Promise.all([
@@ -762,6 +992,10 @@ async function selectECS(server) {
   } catch(e) {
     document.getElementById('vol-container').innerHTML = `<div class="card-body text-muted">Error: ${esc(e.message)}</div>`;
   }
+
+  // Load backups and policies in parallel
+  loadECSBackups(server.id);
+  loadECSPolicies(server.id);
 }
 
 function renderVolumes(vols) {
@@ -806,8 +1040,131 @@ function renderECSSchedules(scheds) {
   document.getElementById('ecs-sched-container').innerHTML = renderScheduleTable(scheds);
 }
 
+// ── ECS Backups ─────────────────────────────────────────────────────────────
+async function loadECSBackups(ecsId) {
+  const c = document.getElementById('ecs-backups-container');
+  c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  try {
+    const r = await fetch(`${API}/api/ecs/${ecsId}/backups`);
+    const d = await r.json();
+    renderECSBackups(d.backups || []);
+  } catch(e) {
+    c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
+  }
+}
+
+function renderECSBackups(backups) {
+  const c = document.getElementById('ecs-backups-container');
+  if (!backups.length) {
+    c.innerHTML = '<div class="empty"><p>Sin backups registrados para esta ECS</p></div>';
+    return;
+  }
+  c.innerHTML = `
+    <table class="bkp-table">
+      <thead><tr>
+        <th>Fecha</th>
+        <th>Nombre imagen</th>
+        <th>Discos</th>
+        <th>Estado OBS</th>
+        <th>Acciones</th>
+      </tr></thead>
+      <tbody>
+        ${backups.map(bkp => {
+          const snapshots = bkp.snapshots || [];
+          const sysSnap = snapshots.filter(s => s.volume_role === 'system');
+          const dataSnap = snapshots.filter(s => s.volume_role !== 'system');
+          const diskBadges = [
+            sysSnap.length ? `<span class="badge badge-info" style="font-size:10px">Sistema</span>` : '',
+            dataSnap.length ? `<span class="badge badge-warning" style="font-size:10px">${dataSnap.length} datos</span>` : '',
+          ].filter(Boolean).join(' ');
+
+          let obsBadge = '';
+          if (bkp.obs_status === 'exporting') {
+            obsBadge = `<span class="badge badge-running" style="font-size:10px">exportando</span>`;
+          } else if (bkp.obs_status === 'exported' && bkp.ims_deleted) {
+            obsBadge = `<span class="badge badge-obs-only" style="font-size:10px">solo OBS</span>`;
+          } else if (bkp.obs_status === 'exported') {
+            obsBadge = `<span class="badge badge-external" style="font-size:10px">OBS</span>`;
+          } else if (bkp.obs_status === 'dr_only') {
+            obsBadge = `<span class="badge badge-info" style="font-size:10px">DR</span>`;
+          } else if (bkp.obs_status === 'failed') {
+            obsBadge = `<span class="badge badge-error" style="font-size:10px">export fallido</span>`;
+          } else {
+            obsBadge = `<span class="badge badge-stopped" style="font-size:10px">solo IMS</span>`;
+          }
+
+          const canRestore = bkp.image_id && !['pending','data-only'].includes(bkp.image_id) ||
+            (bkp.obs_url && bkp.ims_deleted);
+          const fromOBS = !!(bkp.obs_url && bkp.ims_deleted);
+          const restoreBtn = canRestore
+            ? `<button class="btn btn-restore btn-sm" onclick="confirmRestore(${bkp.id}, '${esc(bkp.ecs_name)}', '${esc(bkp.image_name)}', ${fromOBS})">Restaurar</button>`
+            : '';
+
+          const canExport = bkp.image_id && !['pending','data-only'].includes(bkp.image_id) &&
+            (!bkp.obs_status || bkp.obs_status === 'failed');
+          const exportLbl = bkp.obs_status === 'failed' ? 'Reintentar OBS' : 'OBS';
+          const exportBtn = canExport
+            ? `<button class="btn btn-export btn-sm" onclick="exportToOBS(${bkp.id})">${exportLbl}</button>`
+            : '';
+
+          return `
+            <tr>
+              <td class="text-sm text-muted">${fmtDate(bkp.created_at)}</td>
+              <td class="text-mono truncate" style="max-width:200px">${esc(bkp.image_name || '—')}</td>
+              <td>${diskBadges || '<span class="text-muted text-sm">—</span>'}</td>
+              <td>${obsBadge}</td>
+              <td><div class="flex gap-2">${exportBtn}${restoreBtn}</div></td>
+            </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+}
+
+// ── ECS Policies ─────────────────────────────────────────────────────────────
+async function loadECSPolicies(ecsId) {
+  const c = document.getElementById('ecs-policies-container');
+  c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  try {
+    const r = await fetch(`${API}/api/schedules?ecs_id=${ecsId}`);
+    const d = await r.json();
+    const schedules = (d.schedules || []).filter(s => s.policy_id);
+
+    // Fetch policy details for these schedules
+    let policiesMap = {};
+    if (schedules.length > 0) {
+      const pr = await fetch(`${API}/api/policies`);
+      const pd = await pr.json();
+      (pd.policies || []).forEach(p => { policiesMap[p.id] = p; });
+    }
+
+    if (!schedules.length) {
+      c.innerHTML = '<div class="empty" style="padding:20px"><p>Sin politica asignada. Usa "Asignar a politica" para asociar.</p></div>';
+      return;
+    }
+
+    c.innerHTML = `<div style="padding:16px;display:flex;flex-direction:column;gap:8px">` +
+      schedules.map(s => {
+        const pol = policiesMap[s.policy_id] || {};
+        return `
+          <div class="policy-assigned-row">
+            <div>
+              <span class="policy-assigned-name">${esc(pol.name || 'Politica #' + s.policy_id)}</span>
+              <span class="text-muted text-sm" style="margin-left:8px">${freqLabel(s.frequency_hours)} &middot; retener ${s.retention_count}</span>
+            </div>
+            <button class="btn btn-danger btn-sm" onclick="unassignEcsFromPolicy(${s.policy_id}, '${esc(ecsId)}', '${esc(s.ecs_name)}')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="12" height="12"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              Desasignar
+            </button>
+          </div>`;
+      }).join('') + `</div>`;
+  } catch(e) {
+    c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
+  }
+}
+
 // ── Schedules ──────────────────────────────────────────────────────────────
 function freqLabel(h) {
+  h = parseInt(h);
   if (h === 1) return 'Cada hora';
   if (h < 24) return `Cada ${h}h`;
   if (h === 24) return 'Diario';
@@ -920,7 +1277,7 @@ async function deleteSchedule(id, name) {
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 
-// ── Modal ──────────────────────────────────────────────────────────────────
+// ── Modal: Schedule ─────────────────────────────────────────────────────────
 function onFreqPreset() {
   const v = document.getElementById('f-freq-preset').value;
   const cg = document.getElementById('f-custom-hours-group');
@@ -1085,6 +1442,373 @@ async function saveSchedule() {
   }
 }
 
+// ── Policies ──────────────────────────────────────────────────────────────
+
+async function loadPolicies() {
+  const c = document.getElementById('policies-container');
+  c.innerHTML = '<div class="loading-row"><div class="spinner"></div></div>';
+  try {
+    const [pr, sr] = await Promise.all([
+      fetch(`${API}/api/policies`),
+      fetch(`${API}/api/schedules`),
+    ]);
+    const pd = await pr.json();
+    const sd = await sr.json();
+    const policies = pd.policies || [];
+    const schedules = sd.schedules || [];
+
+    // Cache for assign modal
+    cachedPolicies = policies;
+
+    // Group schedules by policy_id
+    const schedsByPolicy = {};
+    schedules.forEach(s => {
+      if (s.policy_id) {
+        if (!schedsByPolicy[s.policy_id]) schedsByPolicy[s.policy_id] = [];
+        schedsByPolicy[s.policy_id].push(s);
+      }
+    });
+
+    if (!policies.length) {
+      c.innerHTML = '<div class="empty"><div class="empty-icon">&#128196;</div><p>Sin politicas. Crea una con "Nueva politica".</p></div>';
+      return;
+    }
+
+    c.innerHTML = policies.map(p => {
+      const assigned = schedsByPolicy[p.id] || [];
+      const assignedRows = assigned.length
+        ? assigned.map(s => `
+            <div class="policy-ecs-row">
+              <span class="policy-ecs-name">${esc(s.ecs_name)}</span>
+              <button class="btn btn-danger btn-sm" onclick="unassignEcsFromPolicy(${p.id}, '${esc(s.ecs_id)}', '${esc(s.ecs_name)}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="12" height="12"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                Desasignar
+              </button>
+            </div>`).join('')
+        : '<div style="font-size:12px;color:var(--text-muted);padding:6px 0">Sin ECS asignadas</div>';
+
+      return `
+        <div class="policy-card">
+          <div class="policy-card-header">
+            <div>
+              <div class="policy-card-title">${esc(p.name)}</div>
+              <div class="policy-card-meta">${freqLabel(p.frequency_hours)} &middot; retener ${p.retention_count} imagenes &middot; ${p.ecs_count || 0} ECS asignadas</div>
+            </div>
+            <div class="flex gap-2">
+              <button class="btn btn-ghost btn-sm" title="Asignar ECS" onclick="openAssignEcsToPolicyModal(${p.id}, '${esc(p.name)}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                Asignar ECS
+              </button>
+              <button class="btn btn-ghost btn-sm btn-icon" title="Editar politica" onclick="openEditPolicyModal(${JSON.stringify(p).replace(/"/g,'&quot;')})">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              </button>
+              <button class="btn btn-danger btn-sm btn-icon" title="Eliminar politica" onclick="deletePolicy(${p.id}, '${esc(p.name)}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6m4-6v6"/><path d="M9 6V4h6v2"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="policy-card-body">
+            <div class="policy-ecs-list-label">ECS asignadas</div>
+            ${assignedRows}
+          </div>
+        </div>`;
+    }).join('');
+  } catch(e) {
+    c.innerHTML = `<div class="empty"><p>Error: ${esc(e.message)}</p></div>`;
+  }
+}
+
+function openNewPolicyModal() {
+  editingPolicyId = null;
+  document.getElementById('policy-modal-title').textContent = 'Nueva politica';
+  document.getElementById('btn-save-policy').textContent = 'Crear politica';
+  document.getElementById('p-name').value = '';
+  document.getElementById('p-freq-preset').value = '24';
+  document.getElementById('p-retention').value = '7';
+  document.getElementById('p-custom-hours').value = '';
+  document.getElementById('p-custom-hours-group').style.display = 'none';
+  updatePolicyFreqSummary();
+  document.getElementById('policy-modal-backdrop').classList.add('visible');
+  document.getElementById('p-name').focus();
+}
+
+function openEditPolicyModal(p) {
+  editingPolicyId = p.id;
+  document.getElementById('policy-modal-title').textContent = 'Editar politica';
+  document.getElementById('btn-save-policy').textContent = 'Guardar cambios';
+  document.getElementById('p-name').value = p.name;
+  document.getElementById('p-retention').value = p.retention_count;
+
+  const presets = [1, 6, 12, 24, 48, 72, 168];
+  if (presets.includes(p.frequency_hours)) {
+    document.getElementById('p-freq-preset').value = p.frequency_hours;
+    document.getElementById('p-custom-hours-group').style.display = 'none';
+  } else {
+    document.getElementById('p-freq-preset').value = 'custom';
+    document.getElementById('p-custom-hours').value = p.frequency_hours;
+    document.getElementById('p-custom-hours-group').style.display = 'block';
+  }
+  updatePolicyFreqSummary();
+  document.getElementById('policy-modal-backdrop').classList.add('visible');
+}
+
+function closePolicyModal() {
+  document.getElementById('policy-modal-backdrop').classList.remove('visible');
+}
+
+function onPolicyFreqPreset() {
+  const v = document.getElementById('p-freq-preset').value;
+  document.getElementById('p-custom-hours-group').style.display = v === 'custom' ? 'block' : 'none';
+  updatePolicyFreqSummary();
+}
+
+function updatePolicyFreqSummary() {
+  const v = document.getElementById('p-freq-preset').value;
+  const h = v === 'custom' ? parseInt(document.getElementById('p-custom-hours').value) || 0 : parseInt(v);
+  const ret = parseInt(document.getElementById('p-retention').value) || 7;
+  const s = document.getElementById('p-freq-summary');
+  if (h > 0) {
+    const days = (h * ret / 24).toFixed(1);
+    s.textContent = `Backup ${freqLabel(h).toLowerCase()}, conservar ultimas ${ret} imagenes (~${days} dias de cobertura).`;
+  } else s.textContent = '';
+}
+
+function getPolicyFreqHours() {
+  const v = document.getElementById('p-freq-preset').value;
+  if (v === 'custom') return parseInt(document.getElementById('p-custom-hours').value) || 24;
+  return parseInt(v);
+}
+
+async function savePolicy() {
+  const name = document.getElementById('p-name').value.trim();
+  const freq = getPolicyFreqHours();
+  const retention = parseInt(document.getElementById('p-retention').value);
+
+  if (!name) { toast('Ingresa un nombre', 'error'); return; }
+  if (!freq || freq < 1) { toast('Frecuencia invalida', 'error'); return; }
+  if (!retention || retention < 1) { toast('Retencion invalida', 'error'); return; }
+
+  const btn = document.getElementById('btn-save-policy');
+  btn.disabled = true;
+  btn.textContent = 'Guardando...';
+
+  try {
+    if (editingPolicyId) {
+      const r = await fetch(`${API}/api/policies/${editingPolicyId}`, {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({name, frequency_hours: freq, retention_count: retention})
+      });
+      const d = await r.json();
+      if (!r.ok) { toast('Error: ' + (d.error || r.status), 'error'); return; }
+      toast('Politica actualizada', 'success');
+    } else {
+      const r = await fetch(`${API}/api/policies`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({name, frequency_hours: freq, retention_count: retention})
+      });
+      const d = await r.json();
+      if (!r.ok) { toast('Error: ' + (d.error || r.status), 'error'); return; }
+      toast('Politica creada', 'success');
+    }
+    closePolicyModal();
+    loadPolicies();
+  } catch(e) {
+    toast('Error: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = editingPolicyId ? 'Guardar cambios' : 'Crear politica';
+  }
+}
+
+async function deletePolicy(id, name) {
+  if (!confirm(`Eliminar la politica "${name}"?\nDebes desasignar todas las ECS antes de eliminarla.`)) return;
+  try {
+    const r = await fetch(`${API}/api/policies/${id}`, {method:'DELETE'});
+    const d = await r.json();
+    if (!r.ok) { toast('Error: ' + (d.error || r.status), 'error'); return; }
+    toast('Politica eliminada');
+    loadPolicies();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── Assign ECS to Policy Modal ────────────────────────────────────────────────
+
+function openAssignEcsToPolicyModal(policyId, policyName) {
+  assignToPolicyId = policyId;
+  assignToPolicyName = policyName;
+  document.getElementById('assign-ecs-modal-title').textContent = `Asignar ECS a: ${policyName}`;
+
+  // Populate ECS dropdown
+  const sel = document.getElementById('assign-ecs-select');
+  sel.innerHTML = '<option value="">-- Seleccionar ECS --</option>' +
+    cachedECSList.map(s => `<option value="${esc(s.id)}" data-name="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+
+  document.getElementById('assign-ecs-disks').style.display = 'none';
+  document.getElementById('assign-ecs-disk-list').innerHTML = '';
+  document.getElementById('assign-ecs-modal-backdrop').classList.add('visible');
+}
+
+async function onAssignEcsSelect() {
+  const sel = document.getElementById('assign-ecs-select');
+  const ecsId = sel.value;
+  const diskSection = document.getElementById('assign-ecs-disks');
+  const diskList = document.getElementById('assign-ecs-disk-list');
+
+  if (!ecsId) {
+    diskSection.style.display = 'none';
+    diskList.innerHTML = '';
+    return;
+  }
+
+  diskSection.style.display = 'block';
+  diskList.innerHTML = '<span class="text-muted text-sm">Cargando discos...</span>';
+
+  try {
+    const r = await fetch(`${API}/api/ecs/${ecsId}/volumes`);
+    const d = await r.json();
+    const vols = d.volumes || [];
+    if (!vols.length) {
+      diskList.innerHTML = '<span class="text-muted text-sm">Sin discos disponibles</span>';
+      return;
+    }
+    diskList.innerHTML = vols.map(v => {
+      const isSystem = v.bootable === 'true' || v.boot_index === '0';
+      const role = isSystem ? 'Sistema' : 'Datos';
+      const roleCls = isSystem ? 'badge-info' : 'badge-stopped';
+      return `
+        <label class="disk-check">
+          <input type="checkbox" name="assign-vol" value="${esc(v.id)}" checked>
+          <div class="disk-check-info">
+            <div class="disk-check-name">${esc(v.name || v.id.slice(0,8))}</div>
+            <div class="disk-check-meta">
+              <span class="vol-device">${esc(v.device || '-')}</span> &middot;
+              ${v.size ? v.size + ' GB' : '?'} &middot;
+              <span class="badge ${roleCls}" style="font-size:10px;padding:1px 6px">${role}</span>
+            </div>
+          </div>
+        </label>`;
+    }).join('');
+  } catch(e) {
+    diskList.innerHTML = `<span class="text-muted text-sm">Error: ${esc(e.message)}</span>`;
+  }
+}
+
+function closeAssignEcsModal() {
+  document.getElementById('assign-ecs-modal-backdrop').classList.remove('visible');
+  assignToPolicyId = null;
+  assignToPolicyName = null;
+}
+
+async function assignEcsToPolicy() {
+  const sel = document.getElementById('assign-ecs-select');
+  const ecsId = sel.value;
+  const ecsName = sel.options[sel.selectedIndex]?.dataset?.name || '';
+
+  if (!ecsId) { toast('Selecciona una ECS', 'error'); return; }
+  if (!assignToPolicyId) { toast('Error: politica no seleccionada', 'error'); return; }
+
+  const selectedVols = Array.from(document.querySelectorAll('#assign-ecs-disk-list input[name=assign-vol]:checked')).map(i => i.value);
+
+  const btn = document.getElementById('btn-assign-ecs');
+  btn.disabled = true;
+  btn.textContent = 'Asignando...';
+
+  try {
+    const r = await fetch(`${API}/api/policies/${assignToPolicyId}/assign`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ecs_id: ecsId, ecs_name: ecsName, selected_volumes: selectedVols})
+    });
+    const d = await r.json();
+    if (!r.ok) { toast('Error: ' + (d.error || r.status), 'error'); return; }
+    toast(`ECS asignada a politica`, 'success');
+    closeAssignEcsModal();
+    loadPolicies();
+  } catch(e) {
+    toast('Error: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Asignar';
+  }
+}
+
+async function unassignEcsFromPolicy(policyId, ecsId, ecsName) {
+  if (!confirm(`Desasignar "${ecsName}" de esta politica?\nLa programacion automatica sera eliminada.`)) return;
+  try {
+    const r = await fetch(`${API}/api/policies/${policyId}/ecs/${ecsId}`, {method:'DELETE'});
+    const d = await r.json();
+    if (!r.ok) { toast('Error: ' + (d.error || r.status), 'error'); return; }
+    toast('ECS desasignada de la politica');
+    loadPolicies();
+    if (selectedECS && selectedECS.id === ecsId) {
+      loadECSPolicies(ecsId);
+      const sr = await fetch(`${API}/api/schedules?ecs_id=${ecsId}`);
+      const sd = await sr.json();
+      renderECSSchedules(sd.schedules || []);
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── Assign Policy to ECS Modal ─────────────────────────────────────────────
+
+async function openAssignPolicyModal() {
+  if (!selectedECS) { toast('Selecciona una ECS primero', 'error'); return; }
+
+  // Load policies
+  try {
+    const r = await fetch(`${API}/api/policies`);
+    const d = await r.json();
+    cachedPolicies = d.policies || [];
+  } catch(e) {
+    toast('Error cargando politicas: ' + e.message, 'error');
+    return;
+  }
+
+  const sel = document.getElementById('assign-policy-select');
+  sel.innerHTML = '<option value="">-- Seleccionar politica --</option>' +
+    cachedPolicies.map(p => `<option value="${p.id}">${esc(p.name)} — ${freqLabel(p.frequency_hours)} — retener ${p.retention_count}</option>`).join('');
+
+  document.getElementById('assign-policy-modal-backdrop').classList.add('visible');
+}
+
+function closeAssignPolicyModal() {
+  document.getElementById('assign-policy-modal-backdrop').classList.remove('visible');
+}
+
+async function assignPolicyToECS() {
+  const sel = document.getElementById('assign-policy-select');
+  const policyId = parseInt(sel.value);
+  if (!policyId) { toast('Selecciona una politica', 'error'); return; }
+  if (!selectedECS) { toast('Error: no hay ECS seleccionada', 'error'); return; }
+
+  const btn = document.getElementById('btn-assign-policy');
+  btn.disabled = true;
+  btn.textContent = 'Asignando...';
+
+  try {
+    const r = await fetch(`${API}/api/policies/${policyId}/assign`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ecs_id: selectedECS.id, ecs_name: selectedECS.name, selected_volumes: []})
+    });
+    const d = await r.json();
+    if (!r.ok) { toast('Error: ' + (d.error || r.status), 'error'); return; }
+    toast('ECS asignada a politica', 'success');
+    closeAssignPolicyModal();
+    loadECSPolicies(selectedECS.id);
+    const sr = await fetch(`${API}/api/schedules?ecs_id=${selectedECS.id}`);
+    const sd = await sr.json();
+    renderECSSchedules(sd.schedules || []);
+  } catch(e) {
+    toast('Error: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Asignar';
+  }
+}
+
 // ── History ────────────────────────────────────────────────────────────────
 function statusIcon(status) {
   if (status === 'success') return `<div class="history-icon hi-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg></div>`;
@@ -1161,12 +1885,13 @@ async function loadHistory() {
         ? `<button class="btn btn-restore btn-sm" onclick="confirmRestore(${bkpImg.id}, '${esc(h.ecs_name)}', '${esc(h.image_name)}', ${!!bkpImg.ims_deleted})">Restaurar</button>`
         : '';
 
-      // Export button: show when backup succeeded, has system image in IMS, no export yet
+      // Export button: show when backup succeeded, has system image in IMS, and no export in progress/done
       const canExport = h.status === 'success' && bkpImg &&
         bkpImg.image_id && !['pending','data-only'].includes(bkpImg.image_id) &&
-        !bkpImg.obs_status;
+        (!bkpImg.obs_status || bkpImg.obs_status === 'failed');
+      const exportLbl = bkpImg && bkpImg.obs_status === 'failed' ? 'Reintentar OBS' : 'OBS';
       const exportBtn = canExport
-        ? `<button class="btn btn-export btn-sm" onclick="exportToOBS(${bkpImg.id})" title="Exportar a OBS">OBS</button>`
+        ? `<button class="btn btn-export btn-sm" onclick="exportToOBS(${bkpImg.id})" title="Exportar a OBS">${exportLbl}</button>`
         : '';
 
       return `
@@ -1295,10 +2020,25 @@ document.getElementById('modal-backdrop').addEventListener('click', e => {
 document.getElementById('restore-modal-backdrop').addEventListener('click', e => {
   if (e.target === e.currentTarget) closeRestoreModal();
 });
+document.getElementById('policy-modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closePolicyModal();
+});
+document.getElementById('assign-ecs-modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeAssignEcsModal();
+});
+document.getElementById('assign-policy-modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeAssignPolicyModal();
+});
 
 // Keyboard shortcut
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Escape') {
+    closeModal();
+    closePolicyModal();
+    closeAssignEcsModal();
+    closeAssignPolicyModal();
+    closeRestoreModal();
+  }
 });
 
 // ── Init ───────────────────────────────────────────────────────────────────
@@ -1307,6 +2047,8 @@ loadECS();
 setInterval(loadStatus, 60000);
 document.getElementById('f-retention').addEventListener('input', updateFreqSummary);
 document.getElementById('f-custom-hours').addEventListener('input', updateFreqSummary);
+document.getElementById('p-retention').addEventListener('input', updatePolicyFreqSummary);
+document.getElementById('p-custom-hours').addEventListener('input', updatePolicyFreqSummary);
 </script>
 </body>
 </html>
