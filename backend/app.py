@@ -540,8 +540,11 @@ def _obs_request(method, resource, body=b'', content_type='application/xml', reg
     obj_path = ('/' + parts[1]) if len(parts) > 1 else '/'
     obs_region = region or REGION
     url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (bucket_name, obs_region, obj_path)
+    # For streaming GETs (large OBS objects) use a longer connect timeout;
+    # the actual data transfer is bounded by the caller's iter_content loop.
+    req_timeout = (60, 3600) if stream else 30
     return requests.request(method, url, headers=headers, data=body or None,
-                            timeout=30, stream=stream)
+                            timeout=req_timeout, stream=stream)
 
 def _ensure_obs_bucket():
     """Ensure OBS bucket bkp2ims-{project_id} exists.
@@ -763,11 +766,52 @@ def _delete_obs_file(obs_url, region=None):
     else:
         log.warning('Delete OBS file %s: HTTP %s', obs_url, r.status_code)
 
-def _copy_file_to_dr(local_obs_url):
-    """Copy a file from local OBS (sa-argentina-1) to DR OBS (DR_REGION) via streaming.
-    HWC OBS does not support cross-region server-side copy, so we stream download+upload.
-    Returns the DR obs:// URL on success. Raises on error.
+def _obs_put_part(resource, data, region):
+    """Sign and send one multipart upload part. Returns ETag string. Raises on error.
+    Uses a longer timeout than _obs_request (which is capped at 30s).
     """
+    import xml.etree.ElementTree as ET
+    creds = get_credentials()
+    ak, sk, token = creds['ak'], creds['sk'], creds.get('token', '')
+    date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+    content_type = 'application/octet-stream'
+    content_md5 = base64.b64encode(hashlib.md5(data).digest()).decode()
+    obs_h = {}
+    if token:
+        obs_h['x-obs-security-token'] = token
+    canon_hdrs = ''.join('%s:%s\n' % (k, obs_h[k]) for k in sorted(obs_h))
+    string_to_sign = '\n'.join(['PUT', content_md5, content_type, date]) + '\n' + canon_hdrs + resource
+    sig = base64.b64encode(
+        hmac.new(sk.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1).digest()
+    ).decode()
+    # Virtual-hosted URL: resource = /{bucket}/{key}?partNumber=N&uploadId=X
+    rparts = resource.lstrip('/').split('/', 1)
+    bucket_name = rparts[0]
+    obj_path = ('/' + rparts[1]) if len(rparts) > 1 else '/'
+    url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (bucket_name, region, obj_path)
+    headers = {
+        'Date': date,
+        'Content-Type': content_type,
+        'Content-MD5': content_md5,
+        'Content-Length': str(len(data)),
+        'Authorization': 'OBS %s:%s' % (ak, sig),
+    }
+    for k, v in obs_h.items():
+        headers[k] = v
+    r = requests.put(url, headers=headers, data=data, timeout=3600)
+    if r.status_code not in (200, 201):
+        raise Exception('Upload part HTTP %s: %s' % (r.status_code, r.text[:200]))
+    etag = r.headers.get('ETag', '').strip('"')
+    return etag
+
+
+def _copy_file_to_dr(local_obs_url):
+    """Copy a file from local OBS to DR OBS using multipart upload (100 MB parts).
+    HWC OBS does not support cross-region server-side copy, so we stream download
+    and upload in parts. Returns the DR obs:// URL on success. Raises on error.
+    """
+    import xml.etree.ElementTree as ET
+
     if not local_obs_url or not local_obs_url.startswith('obs://'):
         raise ValueError('Invalid obs_url: %s' % local_obs_url)
     parts = local_obs_url[6:].split('/', 1)
@@ -778,49 +822,80 @@ def _copy_file_to_dr(local_obs_url):
     dst_resource = '/%s/%s' % (dst_bucket, key)
     dr_obs_url = 'obs://%s/%s' % (dst_bucket, key)
 
+    PART_SIZE = 100 * 1024 * 1024  # 100 MB — well above OBS 5 MB minimum
+
     # Streaming GET from local OBS
     log.info('DR copy: GET %s', local_obs_url)
     get_resp = _obs_request('GET', src_resource, region=REGION, stream=True)
     if get_resp.status_code != 200:
         raise Exception('DR copy GET HTTP %s: %s' % (get_resp.status_code, get_resp.text[:200]))
+    total_size = int(get_resp.headers.get('Content-Length', 0))
+    content_type = 'application/octet-stream'
 
-    content_length = int(get_resp.headers.get('Content-Length', 0)) or None
-    content_type = get_resp.headers.get('Content-Type', 'application/octet-stream')
+    log.info('DR copy: multipart upload → %s (size=%s)', dr_obs_url, total_size)
 
-    # Sign the PUT with the actual content-length (no body bytes for md5 since we stream)
-    creds = get_credentials()
-    ak, sk, token = creds['ak'], creds['sk'], creds.get('token', '')
-    date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
-    obs_headers = {}
-    if token:
-        obs_headers['x-obs-security-token'] = token
-    canon_hdrs = ''.join('%s:%s\n' % (k, obs_headers[k]) for k in sorted(obs_headers))
-    string_to_sign = '\n'.join(['PUT', '', content_type, date]) + '\n' + canon_hdrs + dst_resource
-    sig = base64.b64encode(
-        hmac.new(sk.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1).digest()
-    ).decode()
-    put_headers = {
-        'Date': date,
-        'Content-Type': content_type,
-        'Authorization': 'OBS %s:%s' % (ak, sig),
-    }
-    if content_length:
-        put_headers['Content-Length'] = str(content_length)
-    for k, v in obs_headers.items():
-        put_headers[k] = v
+    # 1. Initiate multipart upload
+    init_r = _obs_request('POST', dst_resource + '?uploads',
+                          content_type=content_type, region=DR_REGION)
+    if init_r.status_code != 200:
+        raise Exception('DR multipart init HTTP %s: %s' % (init_r.status_code, init_r.text[:200]))
+    root = ET.fromstring(init_r.text)
+    # HWC OBS uses its own namespace; try both HWC and S3 namespaces plus plain
+    upload_id = (root.findtext('{http://obs.myhwclouds.com/doc/2015-06-30/}UploadId') or
+                 root.findtext('{http://s3.amazonaws.com/doc/2006-03-01/}UploadId') or
+                 root.findtext('UploadId'))
+    if not upload_id:
+        # Last resort: regex
+        import re as _re
+        m = _re.search(r'<UploadId>([^<]+)</UploadId>', init_r.text)
+        upload_id = m.group(1) if m else None
+    if not upload_id:
+        raise Exception('No UploadId in multipart init: %s' % init_r.text[:200])
+    log.info('DR multipart uploadId=%s', upload_id[:16])
 
-    dst_parts = dst_resource.lstrip('/').split('/', 1)
-    dst_obj_path = ('/' + dst_parts[1]) if len(dst_parts) > 1 else '/'
-    put_url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (dst_bucket, DR_REGION, dst_obj_path)
+    # 2. Upload parts (stream GET → buffer → upload per part)
+    part_etags = []
+    part_num = 1
+    buf = bytearray()
+    try:
+        for chunk in get_resp.iter_content(chunk_size=8 * 1024 * 1024):
+            buf.extend(chunk)
+            while len(buf) >= PART_SIZE:
+                part_data = bytes(buf[:PART_SIZE])
+                buf = buf[PART_SIZE:]
+                part_resource = '%s?partNumber=%d&uploadId=%s' % (dst_resource, part_num, upload_id)
+                etag = _obs_put_part(part_resource, part_data, DR_REGION)
+                part_etags.append((part_num, etag))
+                log.info('DR part %d uploaded (%.1f MB)', part_num, len(part_data) / 1048576)
+                part_num += 1
+        # Upload remaining data as last part (may be < PART_SIZE)
+        if buf:
+            part_data = bytes(buf)
+            part_resource = '%s?partNumber=%d&uploadId=%s' % (dst_resource, part_num, upload_id)
+            etag = _obs_put_part(part_resource, part_data, DR_REGION)
+            part_etags.append((part_num, etag))
+            log.info('DR last part %d uploaded (%.1f MB)', part_num, len(part_data) / 1048576)
+    except Exception:
+        # Abort multipart on error to avoid orphaned parts
+        try:
+            _obs_request('DELETE', '%s?uploadId=%s' % (dst_resource, upload_id), region=DR_REGION)
+            log.info('DR multipart aborted: %s', upload_id[:16])
+        except Exception:
+            pass
+        raise
 
-    log.info('DR copy: PUT %s (size=%s)', dr_obs_url, content_length)
-    put_resp = requests.put(put_url, headers=put_headers,
-                            data=get_resp.iter_content(chunk_size=8 * 1024 * 1024),
-                            timeout=7200, stream=True)
-    if put_resp.status_code not in (200, 201):
-        raise Exception('DR copy PUT HTTP %s: %s' % (put_resp.status_code, put_resp.text[:200]))
+    # 3. Complete multipart upload
+    parts_xml = ''.join(
+        '<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>' % (n, e)
+        for n, e in part_etags
+    )
+    complete_xml = '<CompleteMultipartUpload>%s</CompleteMultipartUpload>' % parts_xml
+    cmp_r = _obs_request('POST', '%s?uploadId=%s' % (dst_resource, upload_id),
+                         body=complete_xml, content_type='application/xml', region=DR_REGION)
+    if cmp_r.status_code not in (200, 201):
+        raise Exception('DR multipart complete HTTP %s: %s' % (cmp_r.status_code, cmp_r.text[:200]))
 
-    log.info('DR copy complete: %s → %s', local_obs_url, dr_obs_url)
+    log.info('DR copy complete: %s → %s (%d parts)', local_obs_url, dr_obs_url, len(part_etags))
     return dr_obs_url
 
 
