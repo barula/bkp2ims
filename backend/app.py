@@ -453,11 +453,17 @@ def delete_image_and_snapshots(img_id, img_name, backup_image_row_id, keep_obs=F
 
 # ── OBS Export / Import ───────────────────────────────────────────────────────
 
+DR_REGION = os.environ.get('DR_OBS_REGION', 'la-south-2')
+
 def get_obs_bucket():
     """Return the OBS bucket name for this installation: bkp2ims-{project_id}."""
     return 'bkp2ims-%s' % get_project_id()
 
-def _obs_request(method, resource, body=b'', content_type='application/xml'):
+def get_dr_obs_bucket():
+    """Return the DR OBS bucket name: bkp2ims-{project_id}-dr (in DR_REGION)."""
+    return 'bkp2ims-%s-dr' % get_project_id()
+
+def _obs_request(method, resource, body=b'', content_type='application/xml', region=None, extra_obs_headers=None):
     """Sign and execute an OBS V1 REST request (path-style URL).
     resource: canonical resource, e.g. '/bkp2ims-xxx/' or '/bkp2ims-xxx/file.zvhd2'
     """
@@ -474,6 +480,8 @@ def _obs_request(method, resource, body=b'', content_type='application/xml'):
     obs_headers = {}
     if token:
         obs_headers['x-obs-security-token'] = token
+    if extra_obs_headers:
+        obs_headers.update(extra_obs_headers)
 
     # CanonicalizedOBSHeaders: sorted x-obs-* headers
     canon_hdrs = ''.join('%s:%s\n' % (k, obs_headers[k]) for k in sorted(obs_headers))
@@ -497,20 +505,25 @@ def _obs_request(method, resource, body=b'', content_type='application/xml'):
     parts = resource.lstrip('/').split('/', 1)
     bucket_name = parts[0]
     obj_path = ('/' + parts[1]) if len(parts) > 1 else '/'
-    url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (bucket_name, REGION, obj_path)
+    obs_region = region or REGION
+    url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (bucket_name, obs_region, obj_path)
     return requests.request(method, url, headers=headers, data=body or None, timeout=30)
 
 def _ensure_obs_bucket():
-    """Create the OBS bucket bkp2ims-{project_id} if it does not exist."""
+    """Ensure OBS bucket bkp2ims-{project_id} exists.
+    Returns (True, '') on success or (False, error_message) on failure.
+    """
     bucket = get_obs_bucket()
     resource = '/%s/' % bucket
     r = _obs_request('HEAD', resource)
     if r.status_code == 200:
-        log.info('OBS bucket already exists: %s', bucket)
-        return True
+        log.info('OBS bucket exists: %s', bucket)
+        return True, ''
     if r.status_code in (403, 401):
-        log.warning('OBS bucket check: no permissions (HTTP %s) — export will require OBS OperateAccess on agency', r.status_code)
-        return False
+        msg = ('Sin permisos OBS. Agregar "OBS OperateAccess" a la agencia IAM '
+               'de la ECS, o crear el bucket "%s" manualmente en la consola OBS.') % bucket
+        log.warning('OBS bucket HEAD: %s', msg)
+        return False, msg
     if r.status_code == 404:
         xml_body = ('<CreateBucketConfiguration>'
                     '<Location>%s</Location>'
@@ -518,11 +531,56 @@ def _ensure_obs_bucket():
         cr = _obs_request('PUT', resource, body=xml_body, content_type='application/xml')
         if cr.status_code in (200, 201):
             log.info('OBS bucket created: %s', bucket)
-            return True
-        log.warning('OBS bucket create HTTP %s: %s', cr.status_code, cr.text[:200])
-        return False
-    log.warning('OBS bucket HEAD unexpected HTTP %s', r.status_code)
-    return False
+            return True, ''
+        if cr.status_code in (403, 401):
+            msg = ('Sin permisos para crear el bucket OBS. '
+                   'Crear manualmente el bucket "%s" en la consola OBS '
+                   '(region %s), o agregar "OBS Administrator" a la agencia IAM.') % (bucket, REGION)
+            log.warning('OBS bucket create denied: %s', msg)
+            return False, msg
+        msg = 'Error creando bucket OBS HTTP %s: %s' % (cr.status_code, cr.text[:200])
+        log.warning(msg)
+        return False, msg
+    msg = 'OBS bucket HEAD inesperado HTTP %s' % r.status_code
+    log.warning(msg)
+    return False, msg
+
+def _ensure_dr_obs_bucket():
+    """Ensure the DR OBS bucket (bkp2ims-{project_id}-dr) exists in DR_REGION with WARM storage.
+    Returns (True, '') on success or (False, error_message) on failure.
+    """
+    bucket = get_dr_obs_bucket()
+    resource = '/%s/' % bucket
+    r = _obs_request('HEAD', resource, region=DR_REGION)
+    if r.status_code == 200:
+        log.info('DR OBS bucket exists: %s (%s)', bucket, DR_REGION)
+        return True, ''
+    if r.status_code in (403, 401):
+        msg = ('Sin permisos OBS DR. Crear manualmente el bucket "%s" en region %s '
+               'o agregar "OBS Administrator" a la agencia IAM.') % (bucket, DR_REGION)
+        log.warning('DR OBS bucket HEAD: %s', msg)
+        return False, msg
+    if r.status_code == 404:
+        xml_body = ('<CreateBucketConfiguration>'
+                    '<Location>%s</Location>'
+                    '</CreateBucketConfiguration>') % DR_REGION
+        cr = _obs_request('PUT', resource, body=xml_body, content_type='application/xml',
+                          region=DR_REGION, extra_obs_headers={'x-obs-storage-class': 'WARM'})
+        if cr.status_code in (200, 201):
+            log.info('DR OBS bucket created: %s (%s, WARM)', bucket, DR_REGION)
+            return True, ''
+        if cr.status_code in (403, 401):
+            msg = ('Sin permisos para crear el bucket DR OBS. '
+                   'Crear manualmente el bucket "%s" en la consola OBS '
+                   '(region %s, clase WARM).') % (bucket, DR_REGION)
+            log.warning('DR OBS bucket create denied: %s', msg)
+            return False, msg
+        msg = 'Error creando bucket DR OBS HTTP %s: %s' % (cr.status_code, cr.text[:200])
+        log.warning(msg)
+        return False, msg
+    msg = 'DR OBS bucket HEAD inesperado HTTP %s' % r.status_code
+    log.warning(msg)
+    return False, msg
 
 def _export_image_to_obs(image_id, obs_filename):
     """Export one IMS image to OBS. Returns the obs:// URL. Blocks until job completes."""
@@ -575,12 +633,17 @@ def _export_backup_to_obs(backup_image_id):
     data_items = [dict(r) for r in data_items]
     conn.close()
 
-    if not _ensure_obs_bucket():
+    ok, err_msg = _ensure_obs_bucket()
+    if not ok:
         conn = get_db()
         conn.execute('UPDATE backup_images SET obs_status=? WHERE id=?', ('failed', backup_image_id))
         conn.commit(); conn.close()
-        log.error('Export backup %d: cannot access OBS bucket', backup_image_id)
+        log.error('Export backup %d: %s', backup_image_id, err_msg)
         return
+
+    ok_dr, err_dr = _ensure_dr_obs_bucket()
+    if not ok_dr:
+        log.warning('DR OBS bucket no disponible, continuando sin DR: %s', err_dr)
 
     errors = []
 
@@ -1596,7 +1659,8 @@ def startup():
     reload_schedules()
     scheduler.start()
     pid = get_project_id()
-    log.info('App started. Region=%s ProjectID=%s OBS_Bucket=%s', REGION, pid, 'bkp2ims-%s' % pid)
+    log.info('App started. Region=%s ProjectID=%s OBS_Bucket=%s DR_Bucket=%s@%s',
+             REGION, pid, 'bkp2ims-%s' % pid, 'bkp2ims-%s-dr' % pid, DR_REGION)
 
 startup()
 
