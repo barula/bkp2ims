@@ -184,9 +184,13 @@ def init_db():
         'ALTER TABLE backup_images ADD COLUMN obs_status TEXT',
         'ALTER TABLE backup_images ADD COLUMN ims_deleted INTEGER DEFAULT 0',
         'ALTER TABLE backup_images ADD COLUMN os_type TEXT',
+        'ALTER TABLE backup_images ADD COLUMN obs_dr_url TEXT',
+        'ALTER TABLE backup_images ADD COLUMN obs_dr_status TEXT',
         'ALTER TABLE backup_snapshots ADD COLUMN obs_url TEXT',
         'ALTER TABLE backup_snapshots ADD COLUMN obs_status TEXT',
         'ALTER TABLE backup_snapshots ADD COLUMN ims_deleted INTEGER DEFAULT 0',
+        'ALTER TABLE backup_snapshots ADD COLUMN obs_dr_url TEXT',
+        'ALTER TABLE backup_snapshots ADD COLUMN obs_dr_status TEXT',
     ]:
         try:
             conn.execute(migration)
@@ -397,12 +401,14 @@ def delete_image_and_snapshots(img_id, img_name, backup_image_row_id, keep_obs=F
     """Delete an IMS image and all its associated data disk IMS images.
     If keep_obs=True and obs_url is set: mark ims_deleted=1 (row kept for OBS restore)
     instead of deleted=1. Pass keep_obs=True for user-initiated deletes; False for retention.
+    When keep_obs=False (retention), also delete any DR OBS copies.
     """
     conn = get_db()
     bimg_row = conn.execute(
-        'SELECT obs_url FROM backup_images WHERE id=?', (backup_image_row_id,)
+        'SELECT obs_url, obs_dr_url FROM backup_images WHERE id=?', (backup_image_row_id,)
     ).fetchone()
     has_obs = bimg_row and bimg_row['obs_url']
+    has_dr = bimg_row and bimg_row['obs_dr_url']
     conn.close()
 
     # Delete system disk IMS image (skip placeholder 'data-only' entries)
@@ -422,15 +428,23 @@ def delete_image_and_snapshots(img_id, img_name, backup_image_row_id, keep_obs=F
         except Exception as e:
             log.error('Delete IMS image %s error: %s', img_id, e)
 
+    # On retention delete (keep_obs=False): remove local OBS + DR OBS files
+    if not keep_obs:
+        if has_obs:
+            _delete_obs_file(bimg_row['obs_url'])
+        if has_dr:
+            _delete_obs_file(bimg_row['obs_dr_url'], region=DR_REGION)
+
     # Delete associated data disk IMS images
     conn = get_db()
     items = conn.execute(
-        'SELECT snapshot_id, snapshot_name, backup_type, obs_url FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
+        'SELECT snapshot_id, snapshot_name, backup_type, obs_url, obs_dr_url FROM backup_snapshots WHERE backup_image_id=? AND deleted=0',
         (backup_image_row_id,)
     ).fetchall()
     conn.close()
     for item in items:
         item_has_obs = item['obs_url']
+        item_has_dr = item['obs_dr_url']
         try:
             # All new items are ims_image; legacy evs_snapshot items use EVS DELETE
             if item['backup_type'] == 'evs_snapshot':
@@ -446,6 +460,12 @@ def delete_image_and_snapshots(img_id, img_name, backup_image_row_id, keep_obs=F
                 else:
                     conn.execute('UPDATE backup_snapshots SET deleted=1 WHERE snapshot_id=?', (item['snapshot_id'],))
                 conn.commit(); conn.close()
+                # On retention delete: remove OBS files
+                if not keep_obs:
+                    if item_has_obs:
+                        _delete_obs_file(item['obs_url'])
+                    if item_has_dr:
+                        _delete_obs_file(item['obs_dr_url'], region=DR_REGION)
             else:
                 log.warning('Delete data item %s: HTTP %s %s', item['snapshot_id'], r.status_code, r.text[:150])
         except Exception as e:
@@ -463,9 +483,12 @@ def get_dr_obs_bucket():
     """Return the DR OBS bucket name: bkp2ims-{project_id}-dr (in DR_REGION)."""
     return 'bkp2ims-%s-dr' % get_project_id()
 
-def _obs_request(method, resource, body=b'', content_type='application/xml', region=None, extra_obs_headers=None):
-    """Sign and execute an OBS V1 REST request (path-style URL).
+def _obs_request(method, resource, body=b'', content_type='application/xml', region=None,
+                 extra_obs_headers=None, stream=False, content_length=None):
+    """Sign and execute an OBS V1 REST request (virtual-hosted style URL).
     resource: canonical resource, e.g. '/bkp2ims-xxx/' or '/bkp2ims-xxx/file.zvhd2'
+    stream=True: pass through to requests for streaming responses (GET downloads).
+    content_length: if set, used in signature instead of md5 (for streaming PUT).
     """
     creds = get_credentials()
     ak, sk, token = creds['ak'], creds['sk'], creds.get('token', '')
@@ -474,7 +497,7 @@ def _obs_request(method, resource, body=b'', content_type='application/xml', reg
         body = body.encode('utf-8')
 
     content_md5 = ''
-    if body:
+    if body and not stream:
         content_md5 = base64.b64encode(hashlib.md5(body).digest()).decode()
 
     obs_headers = {}
@@ -497,6 +520,8 @@ def _obs_request(method, resource, body=b'', content_type='application/xml', reg
     }
     if content_md5:
         headers['Content-MD5'] = content_md5
+    if content_length is not None:
+        headers['Content-Length'] = str(content_length)
     for k, v in obs_headers.items():
         headers[k] = v
 
@@ -507,7 +532,8 @@ def _obs_request(method, resource, body=b'', content_type='application/xml', reg
     obj_path = ('/' + parts[1]) if len(parts) > 1 else '/'
     obs_region = region or REGION
     url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (bucket_name, obs_region, obj_path)
-    return requests.request(method, url, headers=headers, data=body or None, timeout=30)
+    return requests.request(method, url, headers=headers, data=body or None,
+                            timeout=30, stream=stream)
 
 def _ensure_obs_bucket():
     """Ensure OBS bucket bkp2ims-{project_id} exists.
@@ -701,13 +727,21 @@ def _export_backup_to_obs(backup_image_id):
             bimg.get('image_id', ''), bimg.get('image_name', ''),
             backup_image_id, keep_obs=True
         )
+        # Migrate older backups (not this one) to DR OBS, remove from local OBS
+        if ok_dr and bimg.get('schedule_id') and bimg.get('ecs_id'):
+            try:
+                conn = get_db()
+                _migrate_old_backups_to_dr(conn, bimg['schedule_id'], bimg['ecs_id'], backup_image_id)
+                conn.close()
+            except Exception as e:
+                log.error('DR migration error for backup %d: %s', backup_image_id, e)
 
     if errors:
         log.error('Export backup %d finished with errors: %s', backup_image_id, '; '.join(errors))
     else:
         log.info('Export backup %d finished OK', backup_image_id)
 
-def _delete_obs_file(obs_url):
+def _delete_obs_file(obs_url, region=None):
     """Delete a file from OBS. obs_url format: obs://bucket/filename.zvhd2"""
     if not obs_url or not obs_url.startswith('obs://'):
         return
@@ -715,11 +749,167 @@ def _delete_obs_file(obs_url):
     bucket = parts[0]
     key = parts[1] if len(parts) > 1 else ''
     resource = '/%s/%s' % (bucket, key)
-    r = _obs_request('DELETE', resource)
+    r = _obs_request('DELETE', resource, region=region)
     if r.status_code in (200, 204):
         log.info('Deleted OBS file: %s', obs_url)
     else:
         log.warning('Delete OBS file %s: HTTP %s', obs_url, r.status_code)
+
+def _copy_file_to_dr(local_obs_url):
+    """Copy a file from local OBS (sa-argentina-1) to DR OBS (DR_REGION) via streaming.
+    HWC OBS does not support cross-region server-side copy, so we stream download+upload.
+    Returns the DR obs:// URL on success. Raises on error.
+    """
+    if not local_obs_url or not local_obs_url.startswith('obs://'):
+        raise ValueError('Invalid obs_url: %s' % local_obs_url)
+    parts = local_obs_url[6:].split('/', 1)
+    src_bucket = parts[0]
+    key = parts[1] if len(parts) > 1 else ''
+    dst_bucket = get_dr_obs_bucket()
+    src_resource = '/%s/%s' % (src_bucket, key)
+    dst_resource = '/%s/%s' % (dst_bucket, key)
+    dr_obs_url = 'obs://%s/%s' % (dst_bucket, key)
+
+    # Streaming GET from local OBS
+    log.info('DR copy: GET %s', local_obs_url)
+    get_resp = _obs_request('GET', src_resource, region=REGION, stream=True)
+    if get_resp.status_code != 200:
+        raise Exception('DR copy GET HTTP %s: %s' % (get_resp.status_code, get_resp.text[:200]))
+
+    content_length = int(get_resp.headers.get('Content-Length', 0)) or None
+    content_type = get_resp.headers.get('Content-Type', 'application/octet-stream')
+
+    # Sign the PUT with the actual content-length (no body bytes for md5 since we stream)
+    creds = get_credentials()
+    ak, sk, token = creds['ak'], creds['sk'], creds.get('token', '')
+    date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+    obs_headers = {}
+    if token:
+        obs_headers['x-obs-security-token'] = token
+    canon_hdrs = ''.join('%s:%s\n' % (k, obs_headers[k]) for k in sorted(obs_headers))
+    string_to_sign = '\n'.join(['PUT', '', content_type, date]) + '\n' + canon_hdrs + dst_resource
+    sig = base64.b64encode(
+        hmac.new(sk.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1).digest()
+    ).decode()
+    put_headers = {
+        'Date': date,
+        'Content-Type': content_type,
+        'Authorization': 'OBS %s:%s' % (ak, sig),
+    }
+    if content_length:
+        put_headers['Content-Length'] = str(content_length)
+    for k, v in obs_headers.items():
+        put_headers[k] = v
+
+    dst_parts = dst_resource.lstrip('/').split('/', 1)
+    dst_obj_path = ('/' + dst_parts[1]) if len(dst_parts) > 1 else '/'
+    put_url = 'https://%s.obs.%s.myhuaweicloud.com%s' % (dst_bucket, DR_REGION, dst_obj_path)
+
+    log.info('DR copy: PUT %s (size=%s)', dr_obs_url, content_length)
+    put_resp = requests.put(put_url, headers=put_headers,
+                            data=get_resp.iter_content(chunk_size=8 * 1024 * 1024),
+                            timeout=7200, stream=True)
+    if put_resp.status_code not in (200, 201):
+        raise Exception('DR copy PUT HTTP %s: %s' % (put_resp.status_code, put_resp.text[:200]))
+
+    log.info('DR copy complete: %s → %s', local_obs_url, dr_obs_url)
+    return dr_obs_url
+
+
+def _migrate_old_backups_to_dr(conn, schedule_id, ecs_id, current_backup_id):
+    """For all non-current backups of this schedule/ecs that have been exported to local OBS
+    but not yet migrated to DR, copy files to DR OBS, then delete from local OBS.
+    Retention-expired backups (deleted=1) that are in DR are also cleaned up.
+    """
+    # Find all older exported backups (not the current one, not already fully deleted)
+    rows = conn.execute(
+        '''SELECT bi.id, bi.image_name, bi.obs_url, bi.obs_dr_url, bi.obs_dr_status
+           FROM backup_images bi
+           WHERE bi.schedule_id=? AND bi.ecs_id=? AND bi.id != ?
+             AND (bi.deleted=0 OR bi.ims_deleted=1)
+             AND bi.obs_url IS NOT NULL
+           ORDER BY bi.created_at ASC''',
+        (schedule_id, ecs_id, current_backup_id)
+    ).fetchall()
+
+    for row in rows:
+        row = dict(row)
+        bid = row['id']
+
+        # Skip if already migrated to DR successfully
+        if row.get('obs_dr_status') == 'migrated':
+            # If also deleted from local OBS, nothing to do
+            continue
+
+        # Migrate system disk file to DR if not yet done
+        if row['obs_url'] and row.get('obs_dr_status') != 'migrated':
+            try:
+                dr_url = _copy_file_to_dr(row['obs_url'])
+                conn.execute(
+                    'UPDATE backup_images SET obs_dr_url=?, obs_dr_status=? WHERE id=?',
+                    (dr_url, 'migrated', bid)
+                )
+                conn.commit()
+                log.info('Migrated system OBS to DR: %s → %s', row['obs_url'], dr_url)
+            except Exception as e:
+                log.error('DR migrate system image %d failed: %s', bid, e)
+                conn.execute(
+                    'UPDATE backup_images SET obs_dr_status=? WHERE id=?',
+                    ('failed', bid)
+                )
+                conn.commit()
+                continue  # don't delete local if DR copy failed
+
+        # Migrate data disk files to DR
+        snap_rows = conn.execute(
+            'SELECT id, obs_url, obs_dr_url, obs_dr_status FROM backup_snapshots '
+            'WHERE backup_image_id=? AND obs_url IS NOT NULL',
+            (bid,)
+        ).fetchall()
+        snap_errors = False
+        for snap in snap_rows:
+            snap = dict(snap)
+            if snap.get('obs_dr_status') == 'migrated':
+                continue
+            try:
+                dr_url = _copy_file_to_dr(snap['obs_url'])
+                conn.execute(
+                    'UPDATE backup_snapshots SET obs_dr_url=?, obs_dr_status=? WHERE id=?',
+                    (dr_url, 'migrated', snap['id'])
+                )
+                conn.commit()
+                log.info('Migrated data OBS to DR: %s → %s', snap['obs_url'], dr_url)
+            except Exception as e:
+                log.error('DR migrate data snap %d failed: %s', snap['id'], e)
+                conn.execute(
+                    'UPDATE backup_snapshots SET obs_dr_status=? WHERE id=?',
+                    ('failed', snap['id'])
+                )
+                conn.commit()
+                snap_errors = True
+
+        if snap_errors:
+            continue  # don't delete local OBS if any DR copy failed
+
+        # All DR copies successful → delete local OBS files
+        if row['obs_url']:
+            _delete_obs_file(row['obs_url'])
+            conn.execute(
+                'UPDATE backup_images SET obs_url=NULL, obs_status=? WHERE id=?',
+                ('dr_only', bid)
+            )
+            conn.commit()
+        for snap in snap_rows:
+            snap = dict(snap)
+            if snap['obs_url']:
+                _delete_obs_file(snap['obs_url'])
+                conn.execute(
+                    'UPDATE backup_snapshots SET obs_url=NULL, obs_status=? WHERE id=?',
+                    ('dr_only', snap['id'])
+                )
+                conn.commit()
+        log.info('Backup %d: local OBS deleted, now DR-only', bid)
+
 
 def _import_from_obs(obs_url, name, is_system, os_type='Linux'):
     """Import an IMS image from OBS. Returns new image_id. Blocks until complete."""
@@ -1142,7 +1332,9 @@ def run_restore(backup_image_id):
     conn.close()
 
     has_system = bimg['image_id'] and bimg['image_id'] not in ('data-only', 'pending')
-    need_sys_obs = not has_system and bimg.get('obs_url') and bimg.get('ims_deleted')
+    # Effective OBS URL: prefer local, fall back to DR
+    sys_obs_url = bimg.get('obs_url') or bimg.get('obs_dr_url')
+    need_sys_obs = has_system and bimg.get('ims_deleted') and sys_obs_url
     has_data = len(data_items) > 0
 
     ts_r = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')
@@ -1153,15 +1345,16 @@ def run_restore(backup_image_id):
         import_futures = {}
         with ThreadPoolExecutor(max_workers=1 + len(data_items)) as imp_ex:
             if need_sys_obs:
-                log.info('Restore %d: importing system image from OBS: %s', restore_id, bimg['obs_url'])
-                f = imp_ex.submit(_import_from_obs, bimg['obs_url'],
+                log.info('Restore %d: importing system image from OBS: %s', restore_id, sys_obs_url)
+                f = imp_ex.submit(_import_from_obs, sys_obs_url,
                                   'restore-sys-%s' % ts_r, True,
                                   bimg.get('os_type') or 'Linux')
                 import_futures[f] = 'system'
             for item in data_items:
-                if item.get('obs_url') and item.get('ims_deleted'):
-                    log.info('Restore %d: importing data image from OBS: %s', restore_id, item['obs_url'])
-                    f = imp_ex.submit(_import_from_obs, item['obs_url'],
+                item_obs = item.get('obs_url') or item.get('obs_dr_url')
+                if item_obs and item.get('ims_deleted'):
+                    log.info('Restore %d: importing data image from OBS: %s', restore_id, item_obs)
+                    f = imp_ex.submit(_import_from_obs, item_obs,
                                       'restore-data-%s-%s' % (item['id'], ts_r), False)
                     import_futures[f] = ('data', item['id'])
 
